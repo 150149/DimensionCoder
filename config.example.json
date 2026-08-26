@@ -1,0 +1,16 @@
+{
+	"lightModel": "deepseek-v4-flash",
+	"powerModel": "glm-5.2",
+	"projectRoot": "E:\\workspace",
+	"contextWindow": 1048576,
+	"lightBaseUrl": "https://api.deepseek.com/v1",
+	"powerBaseUrl": "https://api.deepseek.com/v1",
+	"lightApiKey": "sk-123456",
+	"powerApiKey": "sk-123456",
+	"lightInputPrice": 3,
+	"lightCachedPrice": 0.1,
+	"lightOutputPrice": 9,
+	"powerInputPrice": 8,
+	"powerCachedPrice": 2,
+	"powerOutputPrice": 28
+}

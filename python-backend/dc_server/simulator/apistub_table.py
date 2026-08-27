@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+"""由 scripts/build_apistub_table.py 自动生成（勿手改）——L2 全导出名表。
+结构: {'API_NAME': {'dll': 'kernel32', 'argc': n}}；argc 未知为 0（stub 不清理栈）。
+"""
 APISTUB_TABLE: dict = {
     '??0__non_rtti_object@@QEAA@AEBV0@@Z': {"dll": 'msvcrt', "argc": 0},
     '??0__non_rtti_object@@QEAA@PEBD@Z': {"dll": 'msvcrt', "argc": 0},

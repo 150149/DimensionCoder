@@ -1,4 +1,4 @@
-你是 DimensionCoder 的 Final Reviewer Agent — 最终审查者。
+你是 DimensionCoding 的 Final Reviewer Agent — 最终审查者。
 
 ## 最终审查
 

@@ -1,3 +1,16 @@
+"""
+memory/reflect.py — Reflector：agentic 推理循环（Phase 5，可选）
+
+源自 Hindsight 的 reflect/agent.py + tools.py
+
+核心功能：
+- 强制分层检索序列：search_mental_models → search_observations → recall
+- 上下文预算管理：超 max_context_tokens → 强制最终合成
+- Split synthesis：累积结果超预算时分块 → 并行提取 claims → reduce 合成
+- ID 验证：done tool 的 ID 只接受实际检索到的 ID，幻觉 ID 被静默过滤
+- Disposition traits：skepticism / literalism / empathy
+- Directives：硬规则注入 system prompt 的 START 和 END
+"""
 
 from __future__ import annotations
 
@@ -18,7 +31,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_MAX_CONTEXT_TOKENS = 100_000
 
+
 class Reflector:
+    """Agentic 推理循环。
+
+    使用方法：
+        reflector = Reflector(storage, llm_client, recaller)
+        result = await reflector.reflect(bank_id, "从这次任务中学到了什么？")
+    """
 
     def __init__(
         self,
@@ -51,15 +71,30 @@ class Reflector:
         tags: Optional[list[str]] = None,
         response_schema: Optional[dict] = None,
     ) -> dict:
+        """Agentic 推理循环。
+
+        返回 {
+            text: str,
+            based_on: dict,
+            usage: dict,
+            tool_trace: list,
+            llm_trace: list,
+            directives_applied: list,
+            errors: list[str]
+        }
+        """
         errors: list[str] = []
         tool_trace: list[dict] = []
         llm_trace: list[dict] = []
 
+        # 收集证据
         available_memory_ids: set[str] = set()
         available_observation_ids: set[str] = set()
         available_mental_model_ids: set[str] = set()
         collected_evidence: list[dict] = []
 
+        # ── 强制分层检索序列 ────────────────────────────────
+        # 1. Mental models
         models = self.storage.get_mental_models_by_tags(bank_id, tags)
         for m in models:
             available_mental_model_ids.add(m["id"])
@@ -71,6 +106,7 @@ class Reflector:
                 "relevance": 0.8,
             })
 
+        # 2. Observations
         observations = self.storage.list_observations(bank_id, tags)
         for obs in observations:
             available_observation_ids.add(obs["id"])
@@ -83,6 +119,7 @@ class Reflector:
                 "relevance": 0.6,
             })
 
+        # 3. Recall (raw facts)
         recall_result = await self.recaller.recall(
             bank_id, query, max_tokens=4096, budget="mid", tags=tags
         )
@@ -97,10 +134,12 @@ class Reflector:
                 "relevance": r.get("scores", {}).get("final", 0.0),
             })
 
+        # ── Directives ─────────────────────────────────────
         directive_text, directives_applied = self._directive_mgr.get_directives_for_prompt(
             bank_id, tags
         )
 
+        # ── 构建消息 ────────────────────────────────────────
         system_prompt = self._build_system_prompt(directive_text)
         user_prompt = self._build_user_prompt(query, collected_evidence)
 
@@ -109,6 +148,7 @@ class Reflector:
             {"role": "user", "content": user_prompt},
         ]
 
+        # ── 调用 LLM ────────────────────────────────────────
         if not self.llm_client:
             return {
                 "text": "",
@@ -120,10 +160,13 @@ class Reflector:
                 "errors": ["No LLM client configured"],
             }
 
+        # 检查上下文预算
         total_tokens = count_tokens(system_prompt) + count_tokens(user_prompt)
         if total_tokens > self._max_context_tokens:
+            # Split synthesis
             answer = await self._split_synthesis(query, collected_evidence, system_prompt)
         else:
+            # 直接调用
             full_response = ""
             async for event in self.llm_client.stream_chat(messages, tools=None, signal=None):
                 if event.get("type") == "text":
@@ -134,6 +177,7 @@ class Reflector:
 
         answer = sanitize_text(answer) or ""
 
+        # ── 构建返回 ────────────────────────────────────────
         based_on: dict[str, Any] = {
             "memories": [eid for eid in available_memory_ids],
             "mental_models": [mid for mid in available_mental_model_ids],
@@ -152,6 +196,7 @@ class Reflector:
         }
 
     def _build_system_prompt(self, directive_text: str) -> str:
+        """构建 system prompt，含 directives 注入 START 和 END。"""
         import os
         prompt_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -163,14 +208,17 @@ class Reflector:
         except FileNotFoundError:
             prompt = _DEFAULT_REFLECT_PROMPT
 
+        # Disposition
         s = self._disposition["skepticism"]
         l = self._disposition["literalism"]
         e = self._disposition["empathy"]
         prompt += f"\n\nDisposition: skepticism={s}/5, literalism={l}/5, empathy={e}/5"
 
+        # Directives START
         if directive_text:
             prompt = f"{directive_text}\n\n{prompt}"
 
+        # Directives END
         if directive_text:
             prompt = f"{prompt}\n\n{directive_text}"
 
@@ -178,8 +226,10 @@ class Reflector:
         return prompt
 
     def _build_user_prompt(self, query: str, evidence: list[dict]) -> str:
+        """构建 user prompt，含收集到的证据。"""
         parts = [f"QUERY: {query}"]
 
+        # 清洗证据（剥离内部字段）
         models = [e for e in evidence if e["type"] == "mental_model"]
         observations = [e for e in evidence if e["type"] == "observation"]
         facts = [e for e in evidence if e["type"] == "fact"]
@@ -197,7 +247,7 @@ class Reflector:
 
         if facts:
             parts.append("\nFACTS:")
-            for f in facts[:30]:
+            for f in facts[:30]:  # 限制 token
                 parts.append(f"- {f['text']} (type: {f.get('fact_type', '')})")
 
         parts.append("\nBased on the above evidence, answer the query.")
@@ -206,9 +256,12 @@ class Reflector:
     async def _split_synthesis(
         self, query: str, evidence: list[dict], system_prompt: str
     ) -> str:
+        """Split synthesis（map-reduce）：累积结果超预算时分块 → 并行提取 claims → reduce 合成。"""
+        # 分块
         chunk_size = 50
         chunks = [evidence[i : i + chunk_size] for i in range(0, len(evidence), chunk_size)]
 
+        # 并行提取 claims
         async def extract_claims(chunk: list[dict]) -> str:
             user_prompt = f"Extract key claims from this evidence:\n" + "\n".join(
                 f"- {e.get('text', e.get('content', ''))}" for e in chunk
@@ -226,6 +279,7 @@ class Reflector:
         tasks = [extract_claims(chunk) for chunk in chunks]
         claims = await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Reduce 合成
         valid_claims = [c for c in claims if isinstance(c, str) and c]
         reduce_prompt = f"Based on these claims, answer: {query}\n\nClaims:\n" + "\n".join(valid_claims)
         messages = [
@@ -237,6 +291,7 @@ class Reflector:
             if event.get("type") == "text":
                 result += event.get("text", "")
         return result
+
 
 _DEFAULT_REFLECT_PROMPT = """You are a reflective reasoning assistant. Answer the query based on the provided evidence (mental models, observations, and facts).
 

@@ -1,14 +1,36 @@
+"""
+密码学常量库（扩充版）[REVISION-6]
 
+包含 CRYPTO_CONSTANTS_DWORD（~200+ 个 32 位常量）、CRYPTO_CONSTANTS_WORD（10 个 16 位常量）、
+CRYPTO_SBOXES（12 个 S-box / 常量表序列）。
+
+覆盖算法：TEA/XTEA/XXTEA, FNV, MD5, SHA-1/224/256/384/512, CRC-32, AES, Blowfish,
+ChaCha20/Salsa20, Mersenne Twister, LCG, RC5/RC6, BLAKE2/BLAKE3, SM4, ARIA, Camellia,
+HMAC, Twofish, DES S-box 1-8, SM4 S-box, GOST S-box 等。
+
+注意：多个算法可能共享同一 DWORD 常量（如 0x9E3779B9 同时是 TEA delta 和 RC5 Q_w），
+本库对共享常量使用合并描述。
+"""
+
+# ============================================================================
+# DWORD (32-bit) 常量库
+# 对共享常量（同一值被多个算法使用）合并为单一条目，描述中列出所有算法。
+# ============================================================================
 CRYPTO_CONSTANTS_DWORD = {
+    # ---- TEA / XTEA / XXTEA / RC5 / RC6 / Jenkins ----
     0x9E3779B9: "TEA/XTEA/XXTEA delta / RC5/RC6 Q_w / Jenkins hash init (Golden Ratio)",
     0xC6EF3720: "TEA delta sum (0x9e3779b9 * 32 mod 2^32)",
     0x61C88647: "TEA variant near_int_delta (-0x9e3779b9 mod 2^32)",
 
+    # ---- FNV (Fowler-Noll-Vo) ----
     0x01000193: "FNV-1/FNV-1a 32-bit prime",
     0x811C9DC5: "FNV-1/FNV-1a 32-bit offset basis",
-    0x00000100000001B3 & 0xFFFFFFFF: "FNV-1/FNV-1a 64-bit prime (low32)",
-    0xCBF29CE484222325 & 0xFFFFFFFF: "FNV-1/FNV-1a 64-bit offset basis (low32)",
+    0x00000100000001B3 & 0xFFFFFFFF: "FNV-1/FNV-1a 64-bit prime (low32)",  # 0x000001B3
+    # 64-bit prime high32 = 0x00000100, too small (< 0x100), will be filtered
+    0xCBF29CE484222325 & 0xFFFFFFFF: "FNV-1/FNV-1a 64-bit offset basis (low32)",  # 0x84222325
+    # 64-bit offset high32 = 0xCBF29CE4
 
+    # ---- MD5 — 完整 64 个 K 常量 ----
     0xD76AA478: "MD5 K[0]",  0xE8C7B756: "MD5 K[1]",
     0x242070DB: "MD5 K[2]",  0xC1BDCEEE: "MD5 K[3]",
     0xF57C0FAF: "MD5 K[4]",  0x4787C62A: "MD5 K[5]",
@@ -42,6 +64,7 @@ CRYPTO_CONSTANTS_DWORD = {
     0xF7537E82: "MD5 K[60]", 0xBD3AF235: "MD5 K[61]",
     0x2AD7D2BB: "MD5 K[62]", 0xEB86D391: "MD5 K[63]",
 
+    # ---- SHA-1 — K0-K3 + H0-H4 初始值 ----
     0x5A827999: "SHA-1 K0 / Camellia Sigma 1 (rounds 0-19)",
     0x6ED9EBA1: "SHA-1 K1 (rounds 20-39)",
     0x8F1BBCDC: "SHA-1 K2 (rounds 40-59)",
@@ -52,6 +75,7 @@ CRYPTO_CONSTANTS_DWORD = {
     0x10325476: "SHA-1 H3 initial value",
     0xC3D2E1F0: "SHA-1 H4 initial value",
 
+    # ---- SHA-256 — 完整 64 个 K 常量 + 8 个 H 初始值 ----
     0x428A2F98: "SHA-256 K[0]",  0x71374491: "SHA-256 K[1]",
     0xB5C0FBCF: "SHA-256 K[2]",  0xE9B5DBA5: "SHA-256 K[3]",
     0x3956C25B: "SHA-256 K[4]",  0x59F111F1: "SHA-256 K[5]",
@@ -84,6 +108,7 @@ CRYPTO_CONSTANTS_DWORD = {
     0x84C87814: "SHA-256 K[58]", 0x8CC70208: "SHA-256 K[59]",
     0x90BEFFFA: "SHA-256 K[60]", 0xA4506CEB: "SHA-256 K[61]",
     0xBEF9A3F7: "SHA-256 K[62]", 0xC67178F2: "SHA-256 K[63]",
+    # SHA-256 / BLAKE2s / BLAKE3 / SHA-512 H init (shared)
     0x6A09E667: "SHA-256 H0 init / SHA-512 H0 high32 / BLAKE2s/BLAKE3 IV[0] / BLAKE2b IV[0] high32",
     0xBB67AE85: "SHA-256 H1 init / SHA-512 H1 high32 / BLAKE2s/BLAKE3 IV[1]",
     0x3C6EF372: "SHA-256 H2 init / SHA-512 H2 high32 / BLAKE2s/BLAKE3 IV[2]",
@@ -93,6 +118,7 @@ CRYPTO_CONSTANTS_DWORD = {
     0x1F83D9AB: "SHA-256 H6 init / SHA-512 H6 high32 / BLAKE2s/BLAKE3 IV[6]",
     0x5BE0CD19: "SHA-256 H7 init / SHA-512 H7 high32 / BLAKE2s/BLAKE3 IV[7]",
 
+    # ---- SHA-512 — H 初始值 low32 (high32 与 SHA-256 共享，见上) ----
     0x08C9BCF3: "SHA-512 H0 init low32 / BLAKE2b IV[0] low32",
     0x84CAA73B: "SHA-512 H1 init low32",
     0xFE94F82B: "SHA-512 H2 init low32",
@@ -102,6 +128,7 @@ CRYPTO_CONSTANTS_DWORD = {
     0xFB41BD6B: "SHA-512 H6 init low32",
     0x137E2179: "SHA-512 H7 init low32",
 
+    # ---- SHA-384 — H 初始值 (high32 / low32) ----
     0xCBBB9D5D: "SHA-384 H0 init high32",
     0xC1059ED8: "SHA-384 H0 init low32 / SHA-224 H0 init",
     0x629A292A: "SHA-384 H1 init high32",
@@ -119,14 +146,18 @@ CRYPTO_CONSTANTS_DWORD = {
     0x47B5481D: "SHA-384 H7 init high32",
     0xBEFA4FA4: "SHA-384 H7 init low32 / SHA-224 H7 init",
 
+    # ---- SHA-224 — H3 init (not shared with SHA-384) ----
     0xF70E5939: "SHA-224 H3 init",
 
+    # ---- CRC ----
     0x04C11DB7: "CRC-32 polynomial (normal form)",
     0xEDB88320: "CRC-32 polynomial (reversed/reflected form)",
     0x82F63B78: "CRC-32C (Castagnoli) polynomial",
 
+    # ---- AES ----
     0x0100011B: "AES irreducible polynomial (x^8+x^4+x^3+x+1) in GF(2^8)",
 
+    # ---- Blowfish — 完整 P-array (18 个) ----
     0x243F6A88: "Blowfish P-array init[0]",
     0x85A308D3: "Blowfish P-array init[1]",
     0x13198A2E: "Blowfish P-array init[2]",
@@ -146,42 +177,54 @@ CRYPTO_CONSTANTS_DWORD = {
     0x9216D5D9: "Blowfish P-array init[16]",
     0x8979FB1B: "Blowfish P-array init[17]",
 
+    # ---- ChaCha20 / Salsa20 ----
     0x61707865: "ChaCha20/Salsa20 constant 'expa'",
     0x3320646E: "ChaCha20/Salsa20 constant 'nd 3'",
     0x79622D32: "ChaCha20/Salsa20 constant '2-by'",
     0x6B206574: "ChaCha20/Salsa20 constant 'te k'",
 
+    # ---- Mersenne Twister MT19937 ----
     0x6C078965: "MT19937 multiplier (1812433253)",
     0x9D2C5680: "MT19937 tempering mask B",
     0xEFC60000: "MT19937 tempering mask C",
 
+    # ---- LCG (Linear Congruential Generator) ----
     0x41C64E6D: "MSVC LCG multiplier (1103515245)",
     0x7FFFFFFF: "MSVC LCG modulus / MINSTD",
     0x000343FD: "borland LCG multiplier (214013)",
     0x0041A7C5: "Java LCG multiplier (25214903917) low32",
     0xDEECE66D: "Java LCG multiplier / Java Random seed multiplier (0x5DEECE66D low32)",
 
+    # ---- RC5/RC6 (P_w; Q_w 与 TEA delta 共享) ----
     0xB7E15163: "RC5/RC6 P_w = Odd((e-2)*2^32)",
 
+    # ---- SM4 ----
     0xA3B1BAC6: "SM4 FK[0]",
     0x56AA3350: "SM4 FK[1]",
     0x677D9197: "SM4 FK[2]",
     0xB27022DC: "SM4 FK[3]",
 
+    # ---- ARIA ----
     0x517CC1B7: "ARIA C1 constant",
     0x6B5F12D9: "ARIA C2 constant",
     0x9CC2F3AC: "ARIA C3 constant",
     0xC26D1C7F: "ARIA C2 constant variant",
 
+    # ---- Camellia ----
     0x36ED61D3: "Camellia Sigma constant 2",
 
+    # ---- HMAC ----
     0x36363636: "HMAC ipad (0x36 repeated)",
     0x5C5C5C5C: "HMAC opad (0x5C repeated)",
 
+    # ---- Twofish ----
     0x8E5BE8A1: "Twofish Q0 permutation marker",
     0x4ABE2153: "Twofish Q1 permutation marker",
 }
 
+# ============================================================================
+# WORD (16-bit) 常量库
+# ============================================================================
 CRYPTO_CONSTANTS_WORD = {
     0x9E37: "TEA delta lower 16 bits (0x9e3779b9 & 0xFFFF)",
     0x79B9: "TEA delta upper 16 bits (0x9e3779b9 >> 16)",
@@ -195,7 +238,11 @@ CRYPTO_CONSTANTS_WORD = {
     0x1D0F: "CRC-16 polynomial (initial value 0x1D0F)",
 }
 
+# ============================================================================
+# S-box / 常量表序列库
+# ============================================================================
 CRYPTO_SBOXES = {
+    # ---- AES S-box (256 bytes) ----
     "AES S-box (256 bytes)": bytes([
         0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
         0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -214,6 +261,7 @@ CRYPTO_SBOXES = {
         0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
         0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
     ]),
+    # ---- AES Inverse S-box (256 bytes) ----
     "AES Inverse S-box (256 bytes)": bytes([
         0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
         0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
@@ -232,6 +280,7 @@ CRYPTO_SBOXES = {
         0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
         0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
     ]),
+    # ---- DES S-box 1-8 (each 64 entries) ----
     "DES S-box 1 (64 entries)": bytes([
         14,  4, 13,  1,  2, 15, 11,  8,  3, 10,  6, 12,  5,  9,  0,  7,
          0, 15,  7,  4, 14,  2, 13,  1, 10,  6, 12, 11,  9,  5,  3,  8,
@@ -280,6 +329,7 @@ CRYPTO_SBOXES = {
          7, 11,  4,  1,  9, 12, 14,  2,  0,  6, 10, 13, 15,  3,  5,  8,
          2,  1, 14,  7,  4, 10,  8, 13, 15, 12,  9,  0,  3,  5,  6, 11,
     ]),
+    # ---- SM4 S-box (256 bytes) ----
     "SM4 S-box (256 bytes)": bytes([
         0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
         0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3, 0xaa, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99,
@@ -298,6 +348,7 @@ CRYPTO_SBOXES = {
         0x89, 0x69, 0x97, 0x4a, 0x0c, 0x96, 0x77, 0x7e, 0x65, 0xb9, 0xf1, 0x09, 0xc5, 0x6e, 0xc6, 0x84,
         0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f, 0x3e, 0xd7, 0xcb, 0x39, 0x48,
     ]),
+    # ---- GOST S-box (CryptoPro, 64 entries) ----
     "GOST S-box (CryptoPro, 128 entries)": bytes([
          4, 10,  9,  2, 13,  8,  0, 14,  6, 11,  1, 12,  7, 15,  5,  3,
         14, 11,  4, 12,  6, 13, 15, 10,  2,  3,  8,  1,  0,  7,  5,  9,

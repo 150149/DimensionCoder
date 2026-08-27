@@ -19,12 +19,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════
+# Monitor 系统 prompt（已迁移到 prompts/monitor.md）
+# 使用 load_prompt("monitor") 和 load_prompt("final-review") 加载
+# ═══════════════════════════════════════════════════════════════════
+
+
 class MonitorContext:
+    """
+    Monitor 上下文准备器 — 纯数据查询。
+
+    不承担 LLM 调用，仅负责：
+    - 从 DB 构建 Monitor 决策所需的上下文
+    - 导出上下文到临时文件夹
+    - 将 Monitor 决策写入 DB
+    """
 
     def __init__(self, storage: StorageAdapter):
         self.storage = storage
 
+    # ═══════════════════════════════════════════════════════════════
+    # 供 rest_api.py 调用的公开方法
+    # ═══════════════════════════════════════════════════════════════
+
     async def get_monitor_context(self, task_id: str, step_id: str = "") -> dict:
+        """
+        获取 Monitor 决策所需的上下文和 LLM messages（供 Extension 调用）。
+
+        Returns:
+            {
+                "messages": [{"role": str, "content": str}],
+                "task_id": str,
+                "current_step_id": str,
+                "pending_steps": list,
+            }
+        """
         tmp_dir = tempfile.mkdtemp(prefix=f"dimensioncoding_monitor_{task_id}_")
         try:
             context = await self._build_monitor_context(task_id, step_id)
@@ -47,6 +76,16 @@ class MonitorContext:
         }
 
     async def apply_monitor_decision(self, task_id: str, decision: dict) -> str:
+        """
+        应用 Monitor 的编排决策。
+
+        Args:
+            task_id: Task ID
+            decision: LLM 返回的 JSON 决策
+
+        Returns:
+            action 描述字符串
+        """
         decision = self._validate_decision(decision)
         action = decision.get("action", "no_change")
 
@@ -57,6 +96,12 @@ class MonitorContext:
         return action
 
     async def get_final_review_context(self, task_id: str) -> dict:
+        """
+        获取最终审查的 LLM messages。
+
+        Returns:
+            {"messages": [...], "task_id": str}
+        """
         tmp_dir = tempfile.mkdtemp(prefix=f"dimensioncoding_monitor_final_{task_id}_")
         try:
             context = await self._build_monitor_context(task_id)
@@ -71,7 +116,12 @@ class MonitorContext:
             "task_id": task_id,
         }
 
+    # ═══════════════════════════════════════════════════════════════
+    # 上下文构建（供 rest_api.py 直接调用）
+    # ═══════════════════════════════════════════════════════════════
+
     async def _build_monitor_context(self, task_id: str, current_step_id: str = "") -> dict:
+        """构建 Monitor 的完整上下文。"""
         task = await self.storage.get_task(task_id)
         if not task:
             raise ValueError(f"Task not found: {task_id}")
@@ -88,6 +138,10 @@ class MonitorContext:
                 if conv:
                     completed_conversations[sid] = conv
 
+        # 续做/rebuild 场景（2026-08-20 修复）：current_step_id 步骤被
+        # reset_flow_from_step 置为 pending，但其对话消息保留——若不纳入摘要，
+        # Monitor 看不到该步骤的进展，会像面对新任务一样重新规划流程
+        # （用户反馈："monitor 不在原上下文跑，新步骤塞到第一步"）
         if current_step_id and current_step_id not in completed_conversations:
             conv = await self.storage.get_conversation(task_id, current_step_id)
             if conv:
@@ -104,6 +158,7 @@ class MonitorContext:
         }
 
     async def _export_monitor_context(self, context: dict, tmp_dir: str, task_id: str) -> str:
+        """导出 Monitor 上下文到临时文件夹，返回导出目录路径"""
         conv_dir = os.path.join(tmp_dir, "conversations")
         os.makedirs(conv_dir, exist_ok=True)
         completed_conv = context.get("completed_conversations", {})
@@ -125,12 +180,17 @@ class MonitorContext:
 
         return tmp_dir
 
+    # ═══════════════════════════════════════════════════════════════
+    # 消息构建
+    # ═══════════════════════════════════════════════════════════════
+
     async def _build_messages(
         self,
         context: dict,
         include_final_review: bool = False,
         export_dir: str = "",
     ) -> list[dict]:
+        """构建 LLM messages"""
         user_parts = []
 
         task = context.get("task", {})
@@ -140,6 +200,7 @@ class MonitorContext:
         status_lines = []
         for s in steps:
             mark = "✓" if s["status"] == "completed" else "◆" if s["status"] == "active" else "⏸" if s["status"] == "stopped" else "─"
+            # 2026-08-22：补类型与 gate 标注（Monitor 决策需区分步骤种类与审批属性）
             status_lines.append(
                 f"  [{mark}] {s['step_id']}: {s.get('title', '')} ({s['status']}"
                 f"{', gate' if s.get('human_attention') == 'gate' else ''}"
@@ -172,12 +233,15 @@ class MonitorContext:
             user_parts.append("# 待执行步骤\n" + "\n".join(pending_lines))
 
         if include_final_review:
+            # 实体化（2026-08-21）：最终审查独立类型 → final-reviewer 提示词
             user_parts.append(load_prompt(prompt_for_step("review", "review")))
 
         current_step = context.get("current_step_id", "")
         if current_step:
             user_parts.append(f"\n刚刚完成的步骤: {current_step}")
 
+        # 2026-08-25（Hindsight 记忆模块 B-4）：注入历史经验（recall）——
+        # enabled 时检索与编排决策相关的历史结论；disabled/异常全部静默跳过
         try:
             from .config import get_memory_config
             mem_cfg = get_memory_config()
@@ -208,7 +272,14 @@ class MonitorContext:
 
         return messages
 
+    # ═══════════════════════════════════════════════════════════════
+    # 决策校验与应用
+    # ═══════════════════════════════════════════════════════════════
+
     def _validate_decision(self, decision: dict) -> dict:
+        """校验 LLM 返回的决策格式"""
+        # 注意：request_human 已删除（用户拍板）——需要人类决策时 Monitor 用
+        # add_steps 插入 human_attention=gate 步骤（见 prompts/monitor.md）
         valid_actions = {
             "no_change", "skip_steps", "add_steps", "remove_steps",
             "reorder_steps", "mark_complete",
@@ -225,6 +296,7 @@ class MonitorContext:
         return decision
 
     async def _apply_decision(self, task_id: str, decision: dict) -> None:
+        """将 Monitor 的决策应用到 steps[]"""
         action = decision.get("action")
 
         if action == "skip_steps":
@@ -258,7 +330,12 @@ class MonitorContext:
             },
         })
 
+    # ═══════════════════════════════════════════════════════════════
+    # 辅助
+    # ═══════════════════════════════════════════════════════════════
+
     def _cleanup_tmp_dir(self, tmp_dir: str) -> None:
+        """清理临时目录"""
         try:
             if os.path.exists(tmp_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)

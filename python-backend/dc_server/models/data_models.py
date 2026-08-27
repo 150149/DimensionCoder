@@ -7,15 +7,23 @@ from enum import Enum
 from typing import Optional, Any
 import uuid
 
+
+# ═══════════════════════════════════════════════════════════════════
+# 枚举类型
+# ═══════════════════════════════════════════════════════════════════
+
+
 class TaskStatus(str, Enum):
     ACTIVE = "active"
     PAUSED = "paused"
     COMPLETED = "completed"
     ABANDONED = "abandoned"
 
+
 class PauseLevel(str, Enum):
-    STEP = "step"
-    FLOW = "flow"
+    STEP = "step"   # 步骤内暂停（⏹打断步骤）
+    FLOW = "flow"   # 流程级暂停（🛑强制介入）
+
 
 class StepStatus(str, Enum):
     PENDING = "pending"
@@ -24,21 +32,25 @@ class StepStatus(str, Enum):
     SKIPPED = "skipped"
     STOPPED = "stopped"
 
+
 class HumanAttention(str, Enum):
     NONE = "none"
     NOTIFY = "notify"
     REVIEW = "review"
     GATE = "gate"
 
+
 class ModelTier(str, Enum):
     LIGHT = "light"
     POWER = "power"
+
 
 class ArtifactType(str, Enum):
     RESULT = "result"
     PROCESS = "process"
     CONVERSATION = "conversation"
     INTERVENTION = "intervention"
+
 
 class EventType(str, Enum):
     STEP_COMPLETE = "step_complete"
@@ -48,13 +60,21 @@ class EventType(str, Enum):
     REQUIREMENT_CHANGE = "requirement_change"
     COMMENT = "comment"
 
+
 class EventActor(str, Enum):
     AI = "ai"
     HUMAN = "human"
     SYSTEM = "system"
 
+
+# ═══════════════════════════════════════════════════════════════════
+# 数据模型
+# ═══════════════════════════════════════════════════════════════════
+
+
 @dataclass
 class Epic:
+    """Epic（一组关联任务）"""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     title: str = ""
     description_md: str = ""
@@ -66,16 +86,23 @@ class Epic:
     def to_dict(self) -> dict:
         return asdict(self)
 
+
 @dataclass
 class StepDefinition:
-    step_id: str
-    title: str
-    required: bool = True
-    parallel_with: list[str] = field(default_factory=list)
-    human_attention: HumanAttention = HumanAttention.NONE
-    model_tier: ModelTier = ModelTier.LIGHT
-    process_template: str = ""
-    process_read_rules: list[str] = field(default_factory=list)
+    """
+    步骤定义（从 TASK_TYPES 硬编码模板复制而来）
+    
+    Task 创建时，从 TASK_TYPES[type] 复制步骤列表，
+    每个步骤成为一个 StepDefinition 存入 task_steps 表。
+    """
+    step_id: str                           # 如 "step-1", "cr-r1", "cr-r2"
+    title: str                             # 如 "需求分析与范围确认"
+    required: bool = True                   # 必做?
+    parallel_with: list[str] = field(default_factory=list)  # 可并行的步骤 step_id
+    human_attention: HumanAttention = HumanAttention.NONE   # none|notify|review|gate
+    model_tier: ModelTier = ModelTier.LIGHT                  # light|power
+    process_template: str = ""             # 过程记录模板（Markdown）
+    process_read_rules: list[str] = field(default_factory=list)  # 可读取的产物步骤 step_id
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -97,8 +124,14 @@ class StepDefinition:
             process_read_rules=data.get("process_read_rules", []),
         )
 
+
 @dataclass
 class TaskStep:
+    """
+    步骤运行时状态（对应 task_steps 表）
+    
+    StepDefinition + 运行时状态 = TaskStep
+    """
     task_id: str = ""
     step_id: str = ""
     title: str = ""
@@ -137,6 +170,7 @@ class TaskStep:
 
     @classmethod
     def from_step_definition(cls, definition: StepDefinition, task_id: str, sort_order: int) -> "TaskStep":
+        """从 StepDefinition 创建运行时 TaskStep"""
         return cls(
             task_id=task_id,
             step_id=definition.step_id,
@@ -150,11 +184,13 @@ class TaskStep:
             sort_order=sort_order,
         )
 
+
 @dataclass
 class Task:
+    """任务（核心实体）"""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     epic_id: Optional[str] = None
-    type: str = ""
+    type: str = ""                          # dev-full-flow | small-change | etc.
     title: str = ""
     description: str = ""
     status: TaskStatus = TaskStatus.ACTIVE
@@ -190,13 +226,15 @@ class Task:
             task.steps = [TaskStep.from_dict(s) for s in data["steps"]]
         return task
 
+
 @dataclass
 class Artifact:
+    """步骤产物"""
     task_id: str = ""
     step_id: str = ""
     artifact_type: ArtifactType = ArtifactType.RESULT
     content: str = ""
-    content_format: str = "json"
+    content_format: str = "json"   # json | markdown
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> dict:
@@ -215,13 +253,15 @@ class Artifact:
             created_at=data.get("created_at", ""),
         )
 
+
 @dataclass
 class Event:
+    """事件记录（append-only）"""
     task_id: str = ""
     event_type: EventType = EventType.STEP_COMPLETE
     step_id: Optional[str] = None
     actor: EventActor = EventActor.AI
-    content: dict = field(default_factory=dict)
+    content: dict = field(default_factory=dict)   # JSON 内容（what_happened + why_decided + ignored_conditions）
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> dict:

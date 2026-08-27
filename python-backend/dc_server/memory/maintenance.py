@@ -1,3 +1,13 @@
+"""
+memory/maintenance.py — MaintenanceLoop：单进程后台维护循环
+
+源自 Hindsight 的 maintenance.py（简化版）
+
+定时任务：
+- Retention sweep（每小时）：删除过期日志
+- Consolidation reconcile（5分钟）：为有未归纳 fact 的 bank 重新调度
+- Mental model refresh（5分钟）：刷新 cron 到期的 model（仅 stale 时）
+"""
 
 from __future__ import annotations
 
@@ -11,11 +21,21 @@ from .storage import MemoryStorage
 logger = logging.getLogger(__name__)
 
 _TICK_SECONDS = 60
-_RETENTION_INTERVAL = 3600
-_CONSOLIDATION_RECONCILE_INTERVAL = 300
-_MM_REFRESH_INTERVAL = 300
+_RETENTION_INTERVAL = 3600  # 1 hour
+_CONSOLIDATION_RECONCILE_INTERVAL = 300  # 5 min
+_MM_REFRESH_INTERVAL = 300  # 5 min
+
 
 class MaintenanceLoop:
+    """单进程后台维护循环。
+
+    使用方法：
+        loop = MaintenanceLoop(storage)
+        # 在 server startup 中：
+        asyncio.create_task(loop.run())
+        # 在 server shutdown 中：
+        loop.stop()
+    """
 
     def __init__(
         self,
@@ -35,6 +55,7 @@ class MaintenanceLoop:
         self._last_mm_refresh: Optional[datetime] = None
 
     def start(self):
+        """启动维护循环。"""
         if self._task and not self._task.done():
             return
         self._running = True
@@ -44,27 +65,33 @@ class MaintenanceLoop:
             logger.warning("No event loop, maintenance loop not started")
 
     def stop(self):
+        """停止维护循环。"""
         self._running = False
         if self._task:
             self._task.cancel()
             self._task = None
 
     async def run(self):
+        """主循环。"""
         await self._run()
 
     async def _run(self):
+        """内部循环。"""
         while self._running:
             try:
                 now = datetime.now(timezone.utc)
 
+                # Retention sweep
                 if self._is_due(self._last_retention, _RETENTION_INTERVAL):
                     self._retention_sweep()
                     self._last_retention = now
 
+                # Consolidation reconcile
                 if self._is_due(self._last_consolidation, _CONSOLIDATION_RECONCILE_INTERVAL):
                     await self._consolidation_reconcile()
                     self._last_consolidation = now
 
+                # Mental model refresh
                 if self._is_due(self._last_mm_refresh, _MM_REFRESH_INTERVAL):
                     await self._mm_refresh_check()
                     self._last_mm_refresh = now
@@ -72,22 +99,29 @@ class MaintenanceLoop:
             except Exception as e:
                 logger.error(f"Maintenance loop error: {e}", exc_info=True)
 
+            # 等待下一个 tick
             await asyncio.sleep(_TICK_SECONDS)
 
     def _is_due(self, last: Optional[datetime], interval: int) -> bool:
+        """检查任务是否到期。"""
         if last is None:
             return True
         elapsed = (datetime.now(timezone.utc) - last).total_seconds()
         return elapsed >= interval
 
     def _retention_sweep(self):
+        """删除过期日志（如果有的话）。"""
+        # DimensionCoder 目前没有独立的 audit_log 或 llm_requests 表
+        # 此处为预留接口，后续可添加日志清理逻辑
         logger.debug("Retention sweep (no-op for now)")
 
     async def _consolidation_reconcile(self):
+        """为有未归纳 fact 的 bank 重新调度 consolidation。"""
         if not self.consolidator:
             return
         stats = self.storage.get_stats()
         if stats.get("facts", 0) > 0:
+            # 获取所有 bank
             conn = self.storage._get_conn()
             banks = conn.execute("SELECT id FROM memory_banks").fetchall()
             for bank in banks:
@@ -100,6 +134,7 @@ class MaintenanceLoop:
                         logger.warning(f"Consolidation reconcile failed for bank {bank_id}: {e}")
 
     async def _mm_refresh_check(self):
+        """刷新 cron 到期的 mental models（仅 stale 时）。"""
         if not self.mental_model_manager:
             return
         conn = self.storage._get_conn()

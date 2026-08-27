@@ -1,3 +1,15 @@
+"""
+memory/fact_extraction.py — FactExtractor：LLM 提取事实
+
+源自 Hindsight 的 retain/fact_extraction.py
+- 4 种提取模式：concise/verbose/verbatim/custom
+- 幂等分块（JSON对话/JSONL/普通文本递归分隔符）
+- OutputTooLongError 自动一分为二重试（最小 500 字符）
+- Lenient parsing：接受 {"facts": [...]} 或裸 [...]；what/factual_core/text 三 key
+- 退化文本拒绝
+- 因果关系验证：target_index < 当前索引，每条最多 2 个
+- 并行提取：asyncio.gather，一个失败整个失败
+"""
 
 from __future__ import annotations
 
@@ -16,42 +28,63 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# ── 常量 ───────────────────────────────────────────────────
+
 DEFAULT_CHUNK_SIZE = 3000
 DEFAULT_STRUCTURED_CHUNK_SIZE = 8192
 _MIN_SPLIT_CHUNK_CHARS = 500
-_SECONDS_PER_FACT = 0.01
+_SECONDS_PER_FACT = 0.01  # 10ms 偏移
 
 VALID_FACT_TYPES = {"world", "experience"}
 VALID_FACT_KINDS = {"event", "conversation"}
+
+# ── 分块 ───────────────────────────────────────────────────
+
 
 def chunk_text(
     text: str,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     structured_chunk_size: int = DEFAULT_STRUCTURED_CHUNK_SIZE,
 ) -> list[str]:
+    """将文本分块。
+
+    策略（按优先级）：
+    1. JSON 对话数组 → 按 turn 边界分块
+    2. JSONL → 按行边界分块
+    3. 普通文本 → 递归分隔符分块
+
+    分块是幂等的：重新分块同一个 chunk 得到自身不变。
+    """
     text = text.strip()
     if not text:
         return []
 
+    # 1. JSON 对话数组
     if text.startswith("["):
         try:
             data = json.loads(text)
             if isinstance(data, list):
                 return _chunk_json_array(data, structured_chunk_size)
         except json.JSONDecodeError:
-            pass
+            pass  # 不是合法 JSON，回退普通文本
 
+    # 2. JSONL（每行一个 JSON 对象）
     lines = text.split("\n")
     if len(lines) > 1 and all(_is_jsonish(l) for l in lines if l.strip()):
         return _chunk_jsonl(lines, structured_chunk_size)
 
+    # 3. 普通文本递归分隔符
     return _chunk_text_recursive(text, chunk_size)
 
+
 def _is_jsonish(line: str) -> bool:
+    """检查是否像 JSON 行（以 { 或 [ 开头）。"""
     stripped = line.strip()
     return stripped.startswith("{") or stripped.startswith("[")
 
+
 def _chunk_json_array(data: list, max_size: int) -> list[str]:
+    """JSON 对话数组按 turn 边界分块，不拆分单个 turn。"""
     chunks: list[str] = []
     current: list[str] = []
     current_size = 0
@@ -68,7 +101,9 @@ def _chunk_json_array(data: list, max_size: int) -> list[str]:
         chunks.append(json.dumps(current, ensure_ascii=False))
     return chunks
 
+
 def _chunk_jsonl(lines: list[str], max_size: int) -> list[str]:
+    """JSONL 按行边界分块。"""
     chunks: list[str] = []
     current: list[str] = []
     current_size = 0
@@ -86,9 +121,12 @@ def _chunk_jsonl(lines: list[str], max_size: int) -> list[str]:
         chunks.append("\n".join(current))
     return chunks
 
+
 _SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""]
 
+
 def _chunk_text_recursive(text: str, max_size: int, separators: Optional[list[str]] = None) -> list[str]:
+    """递归分隔符分块。分隔符优先级：\\n\\n > \\n > . > ! > ? > ; > , > space > empty"""
     if len(text) <= max_size:
         return [text]
 
@@ -99,6 +137,7 @@ def _chunk_text_recursive(text: str, max_size: int, separators: Optional[list[st
         if sep:
             parts = text.split(sep)
         else:
+            # 空分隔符：按字符切
             parts = [text[j : j + max_size] for j in range(0, len(text), max_size)]
 
         chunks: list[str] = []
@@ -113,6 +152,7 @@ def _chunk_text_recursive(text: str, max_size: int, separators: Optional[list[st
         if current:
             chunks.append(current)
 
+        # 如果还是太大，用更细的分隔符递归
         if any(len(c) > max_size for c in chunks):
             next_seps = seps[i + 1 :]
             if next_seps:
@@ -127,7 +167,12 @@ def _chunk_text_recursive(text: str, max_size: int, separators: Optional[list[st
 
     return [text]
 
+
+# ── 提取的 Fact 数据结构 ──────────────────────────────────
+
+
 class ExtractedFact:
+    """LLM 提取的单条 fact（原始，未处理）。"""
 
     def __init__(
         self,
@@ -159,11 +204,16 @@ class ExtractedFact:
 
     @staticmethod
     def _coerce_entity_strings(entities: list) -> list[str]:
+        """将 entities 强制为纯字符串数组。
+
+        兼容老格式 [{"text": "Alice"}] → ["Alice"]
+        """
         result = []
         for e in entities:
             if isinstance(e, str):
                 result.append(e.strip())
             elif isinstance(e, dict):
+                # 兼容 {"text": "..."} 或 {"name": "..."}
                 val = e.get("text") or e.get("name") or str(e)
                 if isinstance(val, str):
                     result.append(val.strip())
@@ -173,6 +223,7 @@ class ExtractedFact:
 
     @staticmethod
     def _validate_causal_relations(relations: list) -> list[dict]:
+        """验证因果关系：target_index 必须是有效索引，每条最多 2 个。"""
         if not relations:
             return []
         valid = []
@@ -189,6 +240,7 @@ class ExtractedFact:
 
     @property
     def fact_text(self) -> str:
+        """组合 fact 文本：what | When: {when} | Involving: {who} | {why}"""
         parts = [self.what]
         if self.when and self.when != "N/A":
             parts.append(f"When: {self.when}")
@@ -199,9 +251,20 @@ class ExtractedFact:
         return " | ".join(parts)
 
     def is_degenerate(self) -> bool:
+        """检查 what 字段是否退化。"""
         return is_degenerate_text(self.what)
 
+
+# ── FactExtractor ─────────────────────────────────────────
+
+
 class FactExtractor:
+    """LLM 驱动的事实提取器。
+
+    使用方法：
+        extractor = FactExtractor(llm_client, model="light")
+        facts = await extractor.extract(text, extraction_mode="concise")
+    """
 
     def __init__(
         self,
@@ -231,6 +294,12 @@ class FactExtractor:
         event_date: Optional[str] = None,
         document_id: Optional[str] = None,
     ) -> list[ExtractedFact]:
+        """从文本提取事实。返回 ExtractedFact 列表。
+
+        1. 分块
+        2. 并行提取（asyncio.gather，一个失败整个失败）
+        3. 退化为空时 raise（不静默返回空列表）
+        """
         text = sanitize_text(text)
         if not text or is_degenerate_text(text):
             return []
@@ -239,6 +308,7 @@ class FactExtractor:
         if not chunks:
             return []
 
+        # 并行提取
         tasks = [
             self._extract_from_chunk(chunk, event_date, document_id, i)
             for i, chunk in enumerate(chunks)
@@ -249,7 +319,7 @@ class FactExtractor:
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Chunk {i} extraction failed: {result}")
-                raise result
+                raise result  # 一个失败整个失败（不静默丢弃）
             all_facts.extend(result)
 
         return all_facts
@@ -261,14 +331,17 @@ class FactExtractor:
         document_id: Optional[str],
         chunk_index: int,
     ) -> list[ExtractedFact]:
+        """从单个 chunk 提取事实。含重试和自动分割。"""
         for attempt in range(self.max_retries + 1):
             try:
                 facts = await self._call_llm_extract(chunk, event_date)
                 return self._process_facts(facts, event_date, chunk_index)
             except _OutputTooLongError:
+                # 输出太长，自动一分为二
                 if len(chunk) < _MIN_SPLIT_CHUNK_CHARS:
-                    raise
+                    raise  # 已经是最小了，无法再分割
                 mid = len(chunk) // 2
+                # 在 mid 附近找分隔符
                 split_pos = _find_split_pos(chunk, mid)
                 left = chunk[:split_pos]
                 right = chunk[split_pos:]
@@ -288,6 +361,7 @@ class FactExtractor:
     async def _call_llm_extract(
         self, chunk: str, event_date: Optional[str]
     ) -> list[dict]:
+        """调用 LLM 提取事实，返回 raw fact dicts。"""
         from .utils import output_language_directive
 
         system_prompt = self._build_system_prompt()
@@ -298,29 +372,36 @@ class FactExtractor:
             {"role": "user", "content": user_prompt},
         ]
 
+        # 调用 LLM（通过 stream_chat 获取完整响应）
         full_response = ""
         async for event in self.llm_client.stream_chat(messages, tools=None, signal=None):
             if event.get("type") == "text":
                 full_response += event.get("text", "")
             elif event.get("type") == "usage":
+                # 检查是否超 token 限制
                 output_tokens = event.get("output_tokens", 0)
                 if output_tokens > 0 and output_tokens > 4000:
                     raise _OutputTooLongError(f"Output tokens: {output_tokens}")
 
+        # 解析 JSON
         parsed = parse_llm_json(full_response)
 
+        # Lenient parsing：接受 {"facts": [...]} 或裸 [...]
         if isinstance(parsed, dict) and "facts" in parsed:
             return parsed["facts"]
         if isinstance(parsed, list):
             return parsed
         if isinstance(parsed, dict):
+            # 单个 fact 对象
             return [parsed]
 
         return []
 
     def _build_system_prompt(self) -> str:
+        """构建系统 prompt（bank-agnostic）。"""
         from .utils import escape_for_prompt, output_language_directive
 
+        # 加载 prompt 模板
         import os
         prompt_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -334,11 +415,13 @@ class FactExtractor:
         except FileNotFoundError:
             system_prompt = _DEFAULT_SYSTEM_PROMPT
 
+        # 追加语言指令
         system_prompt += output_language_directive(self.output_language)
 
         return system_prompt
 
     def _build_user_prompt(self, chunk: str, event_date: Optional[str]) -> str:
+        """构建用户 prompt（每批次变化）。"""
         parts = []
         if self.mission:
             parts.append(f"MISSION: {self.mission}")
@@ -350,10 +433,12 @@ class FactExtractor:
     def _process_facts(
         self, raw_facts: list[dict], event_date: Optional[str], chunk_index: int
     ) -> list[ExtractedFact]:
+        """将 raw dict 列表转为 ExtractedFact 对象。"""
         processed = []
         for i, raw in enumerate(raw_facts):
             if not isinstance(raw, dict):
                 continue
+            # what 从 what/factual_core/text 三 key 取
             what = raw.get("what") or raw.get("factual_core") or raw.get("text") or ""
             if not what:
                 continue
@@ -372,20 +457,30 @@ class FactExtractor:
             )
             if fact.is_degenerate():
                 continue
+            # 时间处理
             if not fact.occurred_start and event_date and fact.fact_kind == "event":
                 fact.occurred_start = _infer_temporal_date(fact.what, event_date)
             processed.append(fact)
         return processed
 
+
 class _OutputTooLongError(Exception):
+    """LLM 输出超出 token 限制。"""
     pass
 
+
 def _find_split_pos(text: str, mid: int) -> int:
+    """在 mid 附近找合适的分割位置（句号/换行/空格）。"""
+    # 在 mid 前后 100 字符内找句号
     for offset in range(100):
         for pos in [mid + offset, mid - offset]:
             if 0 <= pos < len(text) and text[pos] in ".\n!?\n":
                 return pos + 1
+    # 回退到 mid
     return mid
+
+
+# ── 时间推断 ───────────────────────────────────────────────
 
 _RELATIVE_TIME_PATTERNS = [
     (re.compile(r"yesterday", re.I), -1),
@@ -400,7 +495,12 @@ _RELATIVE_TIME_PATTERNS = [
     (re.compile(r"next\s+year", re.I), 365),
 ]
 
+
 def _infer_temporal_date(text: str, event_date: str) -> Optional[str]:
+    """从 fact 文本中用正则匹配相对时间词，转换为绝对日期。
+
+    参考点为 event_date。
+    """
     if not event_date or not text:
         return None
     try:
@@ -414,6 +514,9 @@ def _infer_temporal_date(text: str, event_date: str) -> Optional[str]:
             return result.isoformat()
 
     return None
+
+
+# ── 默认 prompt（当文件不存在时使用）─────────────────────
 
 _DEFAULT_SYSTEM_PROMPT = """You are a fact extraction assistant. Extract memorable facts from the given content.
 

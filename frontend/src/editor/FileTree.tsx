@@ -1,3 +1,16 @@
+// ═══════════════════════════════════════════════════════════════
+// FileTree（SWP4-D / WP4-4 §3.9）
+// - 懒展开渲染：展开目录时请求该层 api.fsTree(path) 单层（问题 6）
+// - 点击目录展开/收起；点击文件 → onOpenFile(path)（posix 相对路径）
+// - FSTREE_HIDDEN（node_modules/.git/dist/.dc_tmp）由后端过滤，前端不渲染
+// - 🔧 徽标（M6/J2b）：markedPaths 中已存在于「已加载树节点」的文件
+//   （api.fsTree 单层懒加载结果不含未展开深层目录，存在性以已加载集合为准；
+//   规格 recursive 全树参数因 api.fsTree 签名缺口（SWP4-A）无法传递，见
+//   verify/SWP4-D_判据执行说明.md 上报项）
+// - ⚠️ 外部已修改角标（J2b）：externalModifiedPaths 中的文件行显示
+//   「⚠️ 已被 AI/他人修改」
+// ═══════════════════════════════════════════════════════════════
+
 import type {CSSProperties} from 'react'
 import {useCallback, useEffect, useState} from 'react'
 import {api} from '../api/client'
@@ -6,28 +19,31 @@ import {Icon} from '../components/icons'
 
 interface FileTreeProps {
     onOpenFile: (path: string) => void
-
+    /** AI 修改徽标候选路径（FlowOverview 从 artifacts 提取，最多 5 个；存在性以已加载节点为准） */
     markedPaths?: string[]
-
+    /** 外部已修改角标路径（J2b） */
     externalModifiedPaths?: string[]
 }
 
+/** posix 相对路径拼接（根层 name 即文件名；子层 parent + '/' + name） */
 function joinPath(parent: string, name: string): string {
     return parent ? `${parent}/${name}` : name
 }
 
+/** 行缩进：动态 depth 经 CSS 变量注入（v2：样式迁移 class，仅缩进保留动态值） */
 const rowPad = (depth: number): CSSProperties => ({paddingLeft: 10 + depth * 14})
 
 export default function FileTree({onOpenFile, markedPaths = [], externalModifiedPaths = []}: FileTreeProps) {
-
+    // 根层（api.fsTree('') 单层）
     const [root, setRoot] = useState<FsEntry[] | null>(null)
-
+    // 目录路径 → 该层 entries（懒加载缓存；null = 未请求）
     const [children, setChildren] = useState<Record<string, FsEntry[]>>({})
     const [expanded, setExpanded] = useState<Set<string>>(new Set())
-
+    // 已加载节点路径集合（存在性检查：根层 + 已展开层）
     const [loadedPaths, setLoadedPaths] = useState<Set<string>>(new Set())
     const [error, setError] = useState('')
 
+    // 根层加载
     useEffect(() => {
         let alive = true
         setRoot(null)
@@ -50,6 +66,7 @@ export default function FileTree({onOpenFile, markedPaths = [], externalModified
         }
     }, [])
 
+    // 展开目录：未加载 → 请求该层（api.fsTree(path) 单层）
     const toggleDir = useCallback(
         (dirPath: string) => {
             setExpanded((prev) => {
@@ -79,6 +96,7 @@ export default function FileTree({onOpenFile, markedPaths = [], externalModified
         [children],
     )
 
+    /** 递归渲染节点（目录可展开；文件可打开） */
     const renderEntry = (entry: FsEntry, parentPath: string, depth: number) => {
         const fullPath = joinPath(parentPath, entry.name)
         if (entry.type === 'dir') {

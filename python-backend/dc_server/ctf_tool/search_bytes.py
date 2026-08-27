@@ -1,10 +1,24 @@
+"""
+search_bytes — 通配符字节搜索工具
+
+解析通配符 pattern（空格分隔的十六进制，`?` 为通配符），在整个二进制中搜索匹配位置，
+返回所有匹配的偏移量和上下文 hex dump。
+
+接口：search_bytes(file_path, pattern) -> str
+"""
 
 import os
 import re
 
+# 最大匹配数量上限
 MAX_MATCHES = 1000
 
+
 def _parse_pattern(pattern_str: str) -> tuple:
+    """
+    解析通配符 pattern，返回 (regex, error_msg)。
+    成功时 error_msg 为 None。
+    """
     tokens = pattern_str.strip().split()
     if not tokens:
         return None, "[ERROR] search_bytes: empty pattern"
@@ -12,7 +26,7 @@ def _parse_pattern(pattern_str: str) -> tuple:
     regex_parts = []
     for token in tokens:
         if token == '?':
-            regex_parts.append(b'.')
+            regex_parts.append(b'.')  # 匹配任意单字节
         else:
             if len(token) != 2 or not all(
                     c in '0123456789abcdefABCDEF' for c in token):
@@ -23,7 +37,9 @@ def _parse_pattern(pattern_str: str) -> tuple:
     regex = re.compile(b''.join(regex_parts), re.DOTALL)
     return regex, None
 
+
 def _search_data(data: bytes, regex: 're.Pattern[bytes]') -> list:
+    """在数据中搜索所有匹配，最多 MAX_MATCHES 个。"""
     matches = []
     for m in regex.finditer(data):
         matches.append(m.start())
@@ -31,7 +47,9 @@ def _search_data(data: bytes, regex: 're.Pattern[bytes]') -> list:
             break
     return matches
 
+
 def _format_context(data: bytes, offset: int, pattern_len: int) -> list:
+    """构建单个匹配的上下文 hex dump 行列表。"""
     context_before = 16
     context_after = 16
     start = max(0, offset - context_before)
@@ -51,8 +69,10 @@ def _format_context(data: bytes, offset: int, pattern_len: int) -> list:
         "",
     ]
 
+
 def _format_output(file_path: str, data: bytes, pattern_str: str,
                    matches: list) -> str:
+    """构建搜索结果输出字符串。"""
     lines = []
     lines.append(f"// Search results for pattern: {pattern_str}")
     lines.append(f"// File: {file_path} ({len(data)} bytes)")
@@ -70,7 +90,9 @@ def _format_output(file_path: str, data: bytes, pattern_str: str,
 
     return "\n".join(lines)
 
+
 def search_bytes(*args: str) -> str:
+    """在二进制文件中搜索通配符字节模式，返回匹配偏移量和上下文 hex dump。"""
     try:
         if len(args) < 2:
             return (f"[ERROR] search_bytes: expected 2 arguments "

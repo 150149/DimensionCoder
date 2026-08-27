@@ -1,3 +1,11 @@
+// ═══════════════════════════════════════════════════════════════
+// Monaco 本地化（SWP4-D / WP4-4 §3.9，P1-6 硬性——内网部署无 CDN）
+// - 唯一实现：本地 worker（?worker 由 Vite 打包为独立 chunk）+
+//   loader.config({monaco}) 覆盖 @monaco-editor/react 默认 loader
+// - 禁止任何从 CDN 加载 monaco 的路径
+// - CodeEditor.tsx 首行 import "./monacoSetup"
+// ═══════════════════════════════════════════════════════════════
+
 import * as monaco from 'monaco-editor'
 import {loader} from '@monaco-editor/react'
 import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
@@ -20,4 +28,6 @@ import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
 
 loader.config({monaco})
 
+// §3.9：「monaco 从 monacoSetup 导入」——CodeEditor 的 Ctrl+S 命令
+// 与 worker 配置使用同一实例（ESM 单例，行为等价于直接 import）
 export {monaco}

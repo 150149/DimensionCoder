@@ -1,3 +1,13 @@
+"""
+memory/storage.py — MemoryStorage：独立 SQLite 连接 + 12 张表 DDL + CRUD
+
+核心设计：
+- 独立 sqlite3.Connection（WAL 模式），与 SQLiteAdapter._conn 完全独立
+- 无跨库外键（source_ref 存 JSON 字符串 {task_id, step_id}）
+- 独立迁移（DDL 在 __init__ 中执行，不在 SQLiteAdapter._migrate 中）
+- 独立关闭（close() 在 server shutdown 时调用）
+- 路径可配置（memory_db_path，默认 {data_dir}/memory.db）
+"""
 
 from __future__ import annotations
 
@@ -21,23 +31,35 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# ── 常量 ───────────────────────────────────────────────────
+
 MAX_TEMPORAL_LINKS_PER_UNIT = 20
 MAX_SEMANTIC_LINKS_PER_UNIT = 20
 MAX_CAUSAL_LINKS_PER_UNIT = 10
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 def _gen_id() -> str:
     return uuid4().hex
+
 
 def build_text_signals(
     fact_text: str,
     metadata: dict,
     mentioned_at: Optional[str] = None,
 ) -> str:
+    """构建 FTS5 text_signals：实体名 + 拼写日期，折叠进可搜索文档。
+
+    使关键词搜索能匹配实体名和日期，例如搜 "Unicorn" 或 "2024年1月" 也能命中。
+    实体名从 metadata 的 where/who/why 字段中提取（简单启发式）。
+    日期从 mentioned_at 格式化为可搜索的拼写形式。
+    """
     parts: list[str] = []
 
+    # 从 metadata 提取实体名
     for key in ("where", "who", "why", "entities"):
         val = metadata.get(key)
         if val and isinstance(val, str):
@@ -45,19 +67,27 @@ def build_text_signals(
         elif val and isinstance(val, list):
             parts.extend(str(v) for v in val)
 
+    # 从 mentioned_at 构建拼写日期
     if mentioned_at:
         try:
             dt = datetime.fromisoformat(mentioned_at.replace("Z", "+00:00"))
+            # strftime 格式: "August 25 2026"（去掉前导零）
             spelled = dt.strftime("%B %d %Y")
+            # 去掉日期的前导零: "August 05" → "August 5"
             spelled = spelled.replace(" 0", " ", 1) if spelled[9:11] == " 0" else spelled
             parts.append(spelled)
+            # 也加数字形式
             parts.append(dt.strftime("%Y-%m-%d"))
         except (ValueError, TypeError):
             pass
 
     return " ".join(parts)
 
+
+# ── DDL ────────────────────────────────────────────────────
+
 DDL_STATEMENTS = [
+    # 1. Bank 定义
     """
     CREATE TABLE IF NOT EXISTS memory_banks (
         id TEXT PRIMARY KEY,
@@ -67,6 +97,7 @@ DDL_STATEMENTS = [
         updated_at TEXT DEFAULT (datetime('now'))
     )
     """,
+    # 2. 原始事实（memory unit）
     """
     CREATE TABLE IF NOT EXISTS memory_facts (
         id TEXT PRIMARY KEY,
@@ -92,6 +123,7 @@ DDL_STATEMENTS = [
         FOREIGN KEY (bank_id) REFERENCES memory_banks(id) ON DELETE CASCADE
     )
     """,
+    # 3. 实体
     """
     CREATE TABLE IF NOT EXISTS memory_entities (
         id TEXT PRIMARY KEY,
@@ -106,6 +138,7 @@ DDL_STATEMENTS = [
         UNIQUE(bank_id, canonical_name)
     )
     """,
+    # 4. Fact-Entity 链接
     """
     CREATE TABLE IF NOT EXISTS memory_fact_entities (
         fact_id TEXT NOT NULL,
@@ -115,6 +148,7 @@ DDL_STATEMENTS = [
         PRIMARY KEY (fact_id, entity_id)
     )
     """,
+    # 5. 共现表
     """
     CREATE TABLE IF NOT EXISTS memory_entity_cooccurrences (
         entity_id_1 TEXT NOT NULL,
@@ -124,6 +158,7 @@ DDL_STATEMENTS = [
         PRIMARY KEY (entity_id_1, entity_id_2)
     )
     """,
+    # 6. 知识图谱边
     """
     CREATE TABLE IF NOT EXISTS memory_links (
         source_fact_id TEXT NOT NULL,
@@ -134,6 +169,7 @@ DDL_STATEMENTS = [
         FOREIGN KEY (target_fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE
     )
     """,
+    # 7. Observation
     """
     CREATE TABLE IF NOT EXISTS memory_observations (
         id TEXT PRIMARY KEY,
@@ -151,6 +187,7 @@ DDL_STATEMENTS = [
         FOREIGN KEY (bank_id) REFERENCES memory_banks(id) ON DELETE CASCADE
     )
     """,
+    # 8. Mental Model
     """
     CREATE TABLE IF NOT EXISTS mental_models (
         id TEXT PRIMARY KEY,
@@ -168,6 +205,7 @@ DDL_STATEMENTS = [
         FOREIGN KEY (bank_id) REFERENCES memory_banks(id) ON DELETE CASCADE
     )
     """,
+    # 9. Knowledge Page 文件夹树
     """
     CREATE TABLE IF NOT EXISTS knowledge_page_folders (
         id TEXT PRIMARY KEY,
@@ -178,6 +216,7 @@ DDL_STATEMENTS = [
         UNIQUE(bank_id, parent_id, name)
     )
     """,
+    # 10. Knowledge Pages
     """
     CREATE TABLE IF NOT EXISTS knowledge_pages (
         id TEXT PRIMARY KEY,
@@ -190,6 +229,7 @@ DDL_STATEMENTS = [
         UNIQUE(bank_id, folder_id, page_name)
     )
     """,
+    # 11. FTS5 虚拟表（text_signals 通过 build_text_signals 构建，写入 fact_text 列）
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_fts USING fts5(
         fact_text, context,
@@ -197,6 +237,7 @@ DDL_STATEMENTS = [
         tokenize='unicode61'
     )
     """,
+    # 12. Directives
     """
     CREATE TABLE IF NOT EXISTS directives (
         id TEXT PRIMARY KEY,
@@ -213,6 +254,7 @@ DDL_STATEMENTS = [
     """,
 ]
 
+# FTS5 同步触发器（无 text_signals 列——通过 build_text_signals 将实体名+日期折叠进 fact_text）
 FTS_TRIGGER_SQL = [
     """
     CREATE TRIGGER IF NOT EXISTS memory_facts_ai AFTER INSERT ON memory_facts BEGIN
@@ -236,7 +278,13 @@ FTS_TRIGGER_SQL = [
     """,
 ]
 
+
 class MemoryStorage:
+    """记忆存储——独立 SQLite 连接，12 张表 + FTS5。
+
+    不共享 SQLiteAdapter._conn，使用自己的 self._conn。
+    业务 DB (dc.db) 保持 7 张表不变。
+    """
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -244,6 +292,7 @@ class MemoryStorage:
         self._init_db()
 
     def _init_db(self):
+        """初始化数据库连接 + DDL（幂等）。"""
         if self.db_path == ":memory:":
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
         else:
@@ -264,7 +313,10 @@ class MemoryStorage:
         self._conn.commit()
         logger.info(f"MemoryStorage initialized: {self.db_path}")
 
+    # ── 生命周期 ───────────────────────────────────────────
+
     def close(self):
+        """关闭记忆 DB 连接。在 server shutdown 时调用。"""
         if self._conn is not None:
             try:
                 self._conn.close()
@@ -274,6 +326,7 @@ class MemoryStorage:
             logger.info("MemoryStorage closed")
 
     async def aclose(self):
+        """异步关闭（兼容 async shutdown）。"""
         self.close()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -282,13 +335,17 @@ class MemoryStorage:
         assert self._conn is not None
         return self._conn
 
+    # ── Bank ────────────────────────────────────────────────
+
     def get_or_create_bank(self, bank_id: str, name: str = "", config: dict | None = None) -> str:
+        """获取或创建 bank。name==bank_id 时不注入 narrator。"""
         conn = self._get_conn()
         existing = conn.execute(
             "SELECT id, name, config FROM memory_banks WHERE id = ?", (bank_id,)
         ).fetchone()
         if existing:
             return bank_id
+        # name==bank_id → 不注入 narrator（路由键污染提取）
         bank_name = name if name and name != bank_id else bank_id
         conn.execute(
             "INSERT INTO memory_banks (id, name, config) VALUES (?, ?, ?)",
@@ -298,8 +355,11 @@ class MemoryStorage:
         return bank_id
 
     def get_or_create_bank_for_project(self, project_root: str) -> str:
+        """根据项目根路径生成 bank_id（sha256 前 16 字符）。"""
         bank_id = hashlib.sha256(project_root.encode("utf-8")).hexdigest()[:16]
         return self.get_or_create_bank(bank_id, name=project_root)
+
+    # ── Fact ────────────────────────────────────────────────
 
     def insert_fact(
         self,
@@ -320,18 +380,29 @@ class MemoryStorage:
         observation_scopes: Optional[list] = None,
         chunk_text_raw: Optional[str] = None,
     ) -> Optional[str]:
+        """插入一条 fact。返回 fact_id 或 None（退化文本跳过）。
+
+        embedding: array.array("f").tobytes() 的 BLOB
+        metadata: 写入前 drop_null_values；注入 src:{fact_id}=1 用于反向查询
+        source_ref: 存 JSON 字符串 {task_id, step_id}
+        observation_scopes: 归纳 scope 标签列表，存 JSON
+        chunk_text_raw: 原始 chunk 文本，用于 content_hash 计算 delta 去重
+        """
         fact_text = sanitize_text(fact_text)
         if is_degenerate_text(fact_text):
             return None
 
         fact_id = _gen_id()
 
+        # text_signals BM25 增强：实体名 + 拼写日期折叠进 fact_text
         ts = build_text_signals(fact_text, metadata or {}, mentioned_at)
         fts_text = fact_text if not ts else f"{fact_text} {ts}"
 
+        # source_key 反向查询：metadata 注入 src:{fact_id}=1
         meta = drop_null_values(metadata or {})
         meta[f"src:{fact_id}"] = "1"
 
+        # content_hash: chunk_text 的 SHA256（delta 去重）
         ch = content_hash(chunk_text_raw) if chunk_text_raw else None
 
         conn = self._get_conn()
@@ -378,6 +449,7 @@ class MemoryStorage:
     def get_unconsolidated_facts(
         self, bank_id: str, limit: int = 50, offset: int = 0
     ) -> list[dict]:
+        """获取未归纳的 facts（consolidated_at IS NULL），按 created_at 升序。"""
         conn = self._get_conn()
         rows = conn.execute(
             """
@@ -429,6 +501,7 @@ class MemoryStorage:
         return [dict(r) for r in rows], total
 
     def get_fact_embeddings(self, bank_id: str, limit: int = 1000) -> list[tuple[str, bytes]]:
+        """获取 bank 内所有 fact 的 (id, embedding) 用于语义搜索。"""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT id, embedding FROM memory_facts WHERE bank_id = ? AND embedding IS NOT NULL LIMIT ?",
@@ -436,19 +509,24 @@ class MemoryStorage:
         ).fetchall()
         return [(r["id"], r["embedding"]) for r in rows]
 
+    # ── Entity ──────────────────────────────────────────────
+
     def find_or_create_entity(
         self,
         bank_id: str,
         canonical_name: str,
         entity_kind: str = "regular",
     ) -> Optional[str]:
+        """查找或创建实体。lowercasing 在 SQL 侧做（避免 Turkish İ 等问题）。"""
         conn = self._get_conn()
+        # 先尝试精确匹配（SQL LOWER）
         row = conn.execute(
             "SELECT id FROM memory_entities WHERE bank_id = ? AND LOWER(canonical_name) = LOWER(?)",
             (bank_id, canonical_name),
         ).fetchone()
         if row:
             return row["id"]
+        # 创建
         entity_id = _gen_id()
         try:
             conn.execute(
@@ -459,6 +537,7 @@ class MemoryStorage:
             conn.commit()
             return entity_id
         except sqlite3.IntegrityError:
+            # 并发创建，回退 SELECT
             row = conn.execute(
                 "SELECT id FROM memory_entities WHERE bank_id = ? AND LOWER(canonical_name) = LOWER(?)",
                 (bank_id, canonical_name),
@@ -481,6 +560,7 @@ class MemoryStorage:
         conn.commit()
 
     def update_entity_stats(self, entity_id: str, mention_count_delta: int = 1):
+        """延迟更新实体统计（mention_count+1, last_seen=MAX）。"""
         conn = self._get_conn()
         conn.execute(
             "UPDATE memory_entities SET mention_count = mention_count + ?, last_seen = ? WHERE id = ?",
@@ -489,6 +569,7 @@ class MemoryStorage:
         conn.commit()
 
     def upsert_cooccurrence(self, entity_id_1: str, entity_id_2: str):
+        """共现表：pair 规范排序 (a < b) 存储，ON CONFLICT count+1。"""
         a, b = sorted([entity_id_1, entity_id_2])
         if a == b:
             return
@@ -506,6 +587,7 @@ class MemoryStorage:
         conn.commit()
 
     def get_cooccurrences(self, bank_id: str, entity_id: str) -> list[dict]:
+        """获取实体的共现实体列表。"""
         conn = self._get_conn()
         rows = conn.execute(
             """
@@ -521,12 +603,17 @@ class MemoryStorage:
         return [dict(r) for r in rows]
 
     def get_entity_degree(self, bank_id: str, entity_id: str) -> int:
+        """该实体共现的不同实体数（用于 hub 抑制）。"""
         return len(self.get_cooccurrences(bank_id, entity_id))
+
+    # ── Link ────────────────────────────────────────────────
 
     def bulk_insert_links(
         self,
         links: list[tuple[str, str, str, float]],
     ):
+        """批量插入链接。links: [(source_fact_id, target_fact_id, link_type, weight), ...]
+        按 (source, target) 排序避免死锁。"""
         if not links:
             return
         conn = self._get_conn()
@@ -545,6 +632,7 @@ class MemoryStorage:
         link_type: str,
         weight: float = 1.0,
     ):
+        """插入单条链接。link_type: "temporal" | "semantic" | "causal" """
         conn = self._get_conn()
         conn.execute(
             "INSERT OR IGNORE INTO memory_links (source_fact_id, target_fact_id, link_type, weight) "
@@ -554,6 +642,7 @@ class MemoryStorage:
         conn.commit()
 
     def count_links(self, fact_id: str, link_type: str, as_source: bool = True) -> int:
+        """统计 fact 的某类出边/入边数。"""
         conn = self._get_conn()
         col = "source_fact_id" if as_source else "target_fact_id"
         row = conn.execute(
@@ -565,6 +654,7 @@ class MemoryStorage:
     def get_linked_facts(
         self, fact_id: str, link_type: Optional[str] = None, as_source: bool = True
     ) -> list[dict]:
+        """获取与 fact 关联的其他 fact。"""
         conn = self._get_conn()
         col = "source_fact_id" if as_source else "target_fact_id"
         target_col = "target_fact_id" if as_source else "source_fact_id"
@@ -591,6 +681,8 @@ class MemoryStorage:
                 (fact_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Observation ─────────────────────────────────────────
 
     def insert_observation(
         self,
@@ -630,6 +722,7 @@ class MemoryStorage:
         new_source_fact_ids: Optional[list] = None,
         new_evidence_quotes: Optional[list] = None,
     ):
+        """更新 observation 文本和来源。proof_count = max(现有, 新来源数)。"""
         conn = self._get_conn()
         existing = conn.execute(
             "SELECT source_fact_ids FROM memory_observations WHERE id = ?", (obs_id,)
@@ -664,6 +757,7 @@ class MemoryStorage:
     def list_observations(self, bank_id: str, tags: Optional[list] = None) -> list[dict]:
         conn = self._get_conn()
         if tags:
+            # tags 精确匹配 scope_tags
             rows = conn.execute(
                 "SELECT * FROM memory_observations WHERE bank_id = ? ORDER BY updated_at DESC",
                 (bank_id,),
@@ -692,6 +786,8 @@ class MemoryStorage:
         conn = self._get_conn()
         conn.execute("DELETE FROM memory_observations WHERE id = ?", (obs_id,))
         conn.commit()
+
+    # ── Mental Model ────────────────────────────────────────
 
     def upsert_mental_model(
         self,
@@ -775,6 +871,7 @@ class MemoryStorage:
         return results
 
     def get_stale_models(self, bank_id: str) -> list[dict]:
+        """返回需要刷新的 models（last_refreshed_at 为空或 scope 内有新 fact）。"""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM mental_models WHERE bank_id = ?", (bank_id,)
@@ -784,6 +881,7 @@ class MemoryStorage:
             if not r["last_refreshed_at"]:
                 results.append(dict(r))
                 continue
+            # 检查 scope 内是否有新 fact
             tags = json.loads(r["tags"] or "[]")
             if tags:
                 placeholders = ",".join("?" * len(tags))
@@ -801,6 +899,7 @@ class MemoryStorage:
         return results
 
     def save_previous_version(self, model_id: str, version: dict):
+        """保存 model 的前一版本到 previous_versions JSON array。"""
         conn = self._get_conn()
         row = conn.execute(
             "SELECT previous_versions FROM mental_models WHERE id = ?", (model_id,)
@@ -809,6 +908,7 @@ class MemoryStorage:
             return
         versions = json.loads(row["previous_versions"] or "[]")
         versions.append(version)
+        # 限制最多 20 个历史版本
         if len(versions) > 20:
             versions = versions[-20:]
         conn.execute(
@@ -817,8 +917,12 @@ class MemoryStorage:
         )
         conn.commit()
 
+    # ── FTS5 搜索 ───────────────────────────────────────────
+
     def fts_search(self, query: str, limit: int = 20) -> list[dict]:
+        """FTS5 全文搜索。返回 memory_facts 行 + bm25 分数。"""
         conn = self._get_conn()
+        # FTS5 MATCH 查询
         rows = conn.execute(
             """
             SELECT f.*, bm25(memory_facts_fts) as bm25_score
@@ -832,7 +936,10 @@ class MemoryStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ── Directives ──────────────────────────────────────────
+
     def get_directives(self, bank_id: str, tags: Optional[list] = None) -> list[dict]:
+        """获取活跃的 directives，按 priority 降序。"""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM directives WHERE bank_id = ? AND is_active = 1 ORDER BY priority DESC",
@@ -878,6 +985,8 @@ class MemoryStorage:
         conn.commit()
         return did
 
+    # ── 统计 ────────────────────────────────────────────────
+
     def get_stats(self) -> dict:
         conn = self._get_conn()
         banks = conn.execute("SELECT COUNT(*) as c FROM memory_banks").fetchone()["c"]
@@ -898,10 +1007,14 @@ class MemoryStorage:
             "directives": directives,
         }
 
+    # ── 格式化 ─────────────────────────────────────────────
+
     def format_recall_for_prompt(self, recall_result: dict) -> str:
+        """将 recall 结果格式化为 plain text 段，注入 system prompt。"""
         parts: list[str] = []
         results = recall_result.get("results", [])
 
+        # Observations 优先
         observations = [r for r in results if r.get("observation_id")]
         facts = [r for r in results if not r.get("observation_id")]
 
@@ -923,6 +1036,8 @@ class MemoryStorage:
 
         return "\n".join(parts) if parts else ""
 
+    # ── Retain 辅助 ─────────────────────────────────────────
+
     def build_retain_text(
         self,
         conv: Optional[list[dict]],
@@ -930,6 +1045,7 @@ class MemoryStorage:
         task: Optional[dict],
         step_id: str,
     ) -> str:
+        """将 DC 的 step 数据转换为 retain 输入文本。"""
         parts: list[str] = []
 
         if task:
@@ -939,7 +1055,7 @@ class MemoryStorage:
 
         if conv:
             parts.append("\nConversation:")
-            for msg in conv[-20:]:
+            for msg in conv[-20:]:  # 最后 20 条消息
                 role = msg.get("role", "unknown")
                 content = msg.get("content", "")
                 if content:
@@ -955,7 +1071,10 @@ class MemoryStorage:
 
         return "\n".join(parts)
 
+    # ── Consolidation Freshness ─────────────────────────────
+
     def get_consolidation_freshness(self, bank_id: str) -> dict:
+        """返回 {last_consolidated_at, last_memory_write_at, pending, failed}。"""
         conn = self._get_conn()
         last_consolidated = conn.execute(
             "SELECT MAX(consolidated_at) as v FROM memory_facts WHERE bank_id = ?", (bank_id,)
@@ -979,6 +1098,7 @@ class MemoryStorage:
         }
 
     def get_last_memory_write_at(self, bank_id: str) -> Optional[str]:
+        """bank 级 watermark——最新 updated_at（用于批量 staleness 检查）。"""
         conn = self._get_conn()
         row = conn.execute(
             "SELECT MAX(created_at) as v FROM memory_facts WHERE bank_id = ?", (bank_id,)
@@ -986,6 +1106,7 @@ class MemoryStorage:
         return row["v"] if row else None
 
     def live_memory_ids(self, bank_id: str, ids: list[str]) -> set[str]:
+        """返回仍存在的 ID 集合（用于 mental model refresh 的 retraction check）。"""
         if not ids:
             return set()
         conn = self._get_conn()
@@ -996,7 +1117,14 @@ class MemoryStorage:
         ).fetchall()
         return {r["id"] for r in rows}
 
+    # ── Source Key 反向查询 ─────────────────────────────────
+
     def find_observations_by_source_fact(self, bank_id: str, fact_id: str) -> list[dict]:
+        """反向查询：基于某条 source fact 的 observations。
+
+        每个 source fact ID 在 metadata 中生成 key src:{unit_id}="1"，
+        支持等值查询。
+        """
         conn = self._get_conn()
         rows = conn.execute(
             """
@@ -1006,6 +1134,7 @@ class MemoryStorage:
             """,
             (bank_id, f'%"{fact_id}"%'),
         ).fetchall()
+        # 精确过滤（LIKE 可能误匹配子串）
         results = []
         for r in rows:
             source_ids = json.loads(r["source_fact_ids"] or "[]")
@@ -1013,9 +1142,18 @@ class MemoryStorage:
                 results.append(dict(r))
         return results
 
+    # ── 删除 Fact + Graph 维护 ──────────────────────────────
+
     def delete_fact(self, fact_id: str):
+        """删除 fact 并触发 graph maintenance。
+
+        FK CASCADE 会自动删除 memory_fact_entities 和 memory_links 中
+        source/target 为此 fact 的行。graph_maintenance 负责补插缺失
+        链接和清理孤立实体。
+        """
         from .graph_maintenance import run_graph_maintenance
 
+        # 先找出受影响的实体和链接（删除前）
         bank_id = None
         incoming_facts: list[str] = []
         entity_ids: list[str] = []
@@ -1027,6 +1165,7 @@ class MemoryStorage:
         if row:
             bank_id = row["bank_id"]
 
+        # 找出出边指向被删 fact 的幸存 fact
         if bank_id:
             rows = conn.execute(
                 "SELECT source_fact_id FROM memory_links WHERE target_fact_id = ?",
@@ -1034,15 +1173,18 @@ class MemoryStorage:
             ).fetchall()
             incoming_facts = [r["source_fact_id"] for r in rows]
 
+            # 找出被删 fact 引用的实体
             rows = conn.execute(
                 "SELECT entity_id FROM memory_fact_entities WHERE fact_id = ?",
                 (fact_id,),
             ).fetchall()
             entity_ids = [r["entity_id"] for r in rows]
 
+        # 执行删除（CASCADE 带走 links + fact_entities）
         conn.execute("DELETE FROM memory_facts WHERE id = ?", (fact_id,))
         conn.commit()
 
+        # graph maintenance: relink top-up + entity prune
         if bank_id:
             try:
                 run_graph_maintenance(

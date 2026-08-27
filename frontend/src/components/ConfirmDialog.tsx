@@ -1,3 +1,11 @@
+// ═══════════════════════════════════════════════════════════════
+// ConfirmDialog（WP4-1 §3 组件清单：props {open, title, rows, onConfirm,
+//   onCancel, confirmText?}）
+// 确认对话框（sidebar.html modal 逐字类），三处复用：
+// - Sidebar custom 创建确认（默认按钮文案「确认创建」）
+// - FlowOverview 删除任务（confirmText="确认删除"）/ 强制介入（"确认介入"）
+// ═══════════════════════════════════════════════════════════════
+
 export interface ConfirmRow {
     step_id: string
     title: string
@@ -11,9 +19,9 @@ interface ConfirmDialogProps {
     rows: ConfirmRow[]
     onConfirm: () => void
     onCancel: () => void
-
+    /** 确认按钮文案（默认「确认创建」，删除/介入场景各自传入） */
     confirmText?: string
-
+    /** 可选说明文案（如重置流程的后果提示），渲染在标题下方 */
     description?: string
 }
 

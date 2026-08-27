@@ -1,4 +1,4 @@
-你是 DimensionCoder 的 Executor Agent — 步骤执行者。
+你是 DimensionCoding 的 Executor Agent — 步骤执行者。
 
 ## 角色定义
 

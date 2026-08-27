@@ -1,19 +1,40 @@
+"""
+get_decompiled_code — angr 反编译工具 [REVISION-1][REVISION-2][REVISION-3][REVISION-5]
+
+使用 angr 加载二进制文件（PE/ELF/raw dump），针对指定地址反编译其所属的**单一函数**，
+返回该函数的 C 伪代码字符串。
+
+接口：get_decompiled_code(file_path, address) -> str
+
+特点:
+  - 仅支持 x86_64 架构 [REVISION-5]
+  - 反编译指定地址所属的单个函数（非全部） [REVISION-1]
+  - 支持 VM 类 CTF 二进制（raw blob 加载 + VM dispatcher 提示） [REVISION-2]
+  - 单 BB 函数输出提示信息而非跳过 [REVISION-3]
+  - Decompiler 调用带超时保护（ThreadPoolExecutor, 120s）
+"""
 
 import os
 from typing import Any, Optional
 
+# angr 在模块级导入可能很慢，延迟到首次调用时导入
 _angr = None
 
+# Decompiler 超时时间（秒）
 DECOMPILER_TIMEOUT = 120
 
+
 def _get_angr() -> Any:
+    """延迟导入 angr，避免 import ctf_tool 时就触发 angr 加载。"""
     global _angr
     if _angr is None:
         import angr as _a
         _angr = _a
     return _angr
 
+
 def _detect_format(file_path: str) -> str:
+    """返回 'pe' / 'elf' / 'raw'"""
     with open(file_path, 'rb') as f:
         magic = f.read(4)
     if magic[:2] == b'MZ':
@@ -23,14 +44,18 @@ def _detect_format(file_path: str) -> str:
     else:
         return 'raw'
 
+
 def _parse_address(addr_str: str) -> int:
+    """解析地址字符串，支持十六进制（0x前缀）和十进制。"""
     addr_str = addr_str.strip()
     if addr_str.lower().startswith('0x'):
         return int(addr_str, 16)
     else:
-        return int(addr_str)
+        return int(addr_str)  # 十进制
+
 
 def _check_function_has_loop(func: Any) -> bool:
+    """简单检查函数是否包含循环（回边）。"""
     try:
         for src, dst in func.transition_graph.edges():
             if hasattr(src, 'addr') and hasattr(dst, 'addr'):
@@ -40,11 +65,19 @@ def _check_function_has_loop(func: Any) -> bool:
     except (AttributeError, TypeError):
         return False
 
+
 def _find_function_containing(cfg: Any, target_addr: int) -> Any:
+    """
+    遍历 cfg.kb.functions，找到包含 target_addr 的函数。
+    检查方式：target_addr 在 [func.addr, func.addr+func.size) 范围内，
+    或 target_addr 在 func.block_addrs_set 中。
+    """
+    # 优先精确匹配函数起始地址（最快路径）
     func = cfg.kb.functions.get(target_addr)
     if func is not None:
         return func
 
+    # 遍历所有函数查找包含关系
     for func in cfg.kb.functions.values():
         if func.size > 0 and func.addr <= target_addr < func.addr + func.size:
             return func
@@ -56,7 +89,9 @@ def _find_function_containing(cfg: Any, target_addr: int) -> Any:
 
     return None
 
+
 def _validate_input(args: tuple) -> Optional[str]:
+    """验证参数数量和文件存在性，返回错误消息或 None（验证通过）。"""
     if len(args) < 2:
         return (f"[ERROR] get_decompiled_code: expected 2 arguments "
                 f"(file_path, address), got {len(args)}")
@@ -67,12 +102,14 @@ def _validate_input(args: tuple) -> Optional[str]:
         return f"[ERROR] get_decompiled_code: file is empty: {file_path}"
     return None
 
+
 def _load_project(file_path: str) -> Any:
+    """加载二进制项目（PE/ELF/raw blob），返回 angr.Project 对象。"""
     angr = _get_angr()
     fmt = _detect_format(file_path)
     if fmt in ('pe', 'elf'):
         return angr.Project(file_path, auto_load_libs=False)
-    else:
+    else:  # raw — 硬编码 x86_64
         return angr.Project(
             file_path,
             auto_load_libs=False,
@@ -81,7 +118,12 @@ def _load_project(file_path: str) -> Any:
                        'base_addr': 0x0}
         )
 
+
 def _run_decompiler(proj: Any, target_func: Any) -> Any:
+    """
+    执行反编译，带超时保护（ThreadPoolExecutor）。
+    超时返回 None；其他异常向上抛出。
+    """
     import concurrent.futures
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(proj.analyses.Decompiler, target_func)
@@ -92,7 +134,9 @@ def _run_decompiler(proj: Any, target_func: Any) -> Any:
     finally:
         executor.shutdown(wait=False)
 
+
 def _format_vm_hint(cfg: Any, target_addr: int) -> str:
+    """格式化地址未找到时的 [VM Hint] 输出。"""
     return (
         f"[ERROR] get_decompiled_code: no function found at address "
         f"{hex(target_addr)}.\n"
@@ -109,7 +153,9 @@ def _format_vm_hint(cfg: Any, target_addr: int) -> str:
         )
     )
 
+
 def _format_imported_func(target_func: Any) -> str:
+    """格式化导入函数（SimProcedure/PLT/syscall）提示。"""
     return (
         f"// ===== {target_func.name} @ {hex(target_func.addr)} =====\n"
         f"// This is an imported/external function "
@@ -117,8 +163,10 @@ def _format_imported_func(target_func: Any) -> str:
         f"// No decompilation available for imported functions."
     )
 
+
 def _format_header(target_func: Any, file_path: str, target_addr: int,
                    block_count: int) -> list:
+    """构建输出头部行列表。"""
     return [
         f"// ===== {target_func.name} @ {hex(target_func.addr)} =====",
         f"// File: {file_path}",
@@ -128,7 +176,9 @@ def _format_header(target_func: Any, file_path: str, target_addr: int,
         "",
     ]
 
+
 def _format_empty_codegen(target_func: Any) -> list:
+    """构建 [Empty Codegen] 提示行列表。"""
     return [
         "// [Empty Codegen] "
         "Decompilation produced no output for this function.",
@@ -148,7 +198,9 @@ def _format_empty_codegen(target_func: Any) -> list:
         "and decompile that function instead",
     ]
 
+
 def _format_vm_dispatcher_hint(block_count: int) -> list:
+    """构建 VM dispatcher 提示行列表。"""
     return [
         "",
         f"// [VM Hint] This function has {block_count} blocks "
@@ -159,44 +211,56 @@ def _format_vm_dispatcher_hint(block_count: int) -> list:
         "in the binary.",
     ]
 
+
 def _format_decompiled_output(
     target_func: Any, file_path: str, target_addr: int,
     d: Any, block_count: int, has_loop: bool
 ) -> str:
+    """格式化反编译成功时的完整输出。"""
     lines = _format_header(target_func, file_path, target_addr, block_count)
 
     if d.codegen and d.codegen.text:
         lines.append(d.codegen.text)
+        # [REVISION-2: VM dispatcher 提示]
         if block_count > 50 and has_loop:
             lines.extend(_format_vm_dispatcher_hint(block_count))
     else:
+        # [REVISION-3: 单 BB 函数提示]
         lines.extend(_format_empty_codegen(target_func))
 
     return "\n".join(lines)
 
+
 def _parse_target_address(addr_str: str) -> tuple:
+    """解析目标地址，返回 (addr, error_msg)。成功时 error_msg 为 None。"""
     try:
         return _parse_address(addr_str), None
     except ValueError:
         return None, (f"[ERROR] get_decompiled_code: invalid address "
                       f"'{addr_str}', expected hex (0x...) or decimal")
 
+
 def _format_decompile_error(target_func: Any, file_path: str,
                             target_addr: int, block_count: int, e: Any) -> str:
+    """格式化反编译异常输出。"""
     lines = _format_header(target_func, file_path, target_addr, block_count)
     lines.append(f"// Decompilation error: {e}")
     lines.append(f"// Function info: {block_count} blocks")
     return "\n".join(lines)
 
+
 def _format_decompile_timeout(target_func: Any, file_path: str,
                               target_addr: int, block_count: int) -> str:
+    """格式化反编译超时输出。"""
     lines = _format_header(target_func, file_path, target_addr, block_count)
     lines.append(f"// [TIMEOUT] Decompilation exceeded {DECOMPILER_TIMEOUT}s "
                  f"time limit.")
     lines.append(f"// Function info: {block_count} blocks")
     return "\n".join(lines)
 
+
 def get_decompiled_code(*args: str) -> str:
+    """使用 angr 反编译指定地址所属的单一函数，返回 C 伪代码字符串。"""
     try:
         err = _validate_input(args)
         if err:

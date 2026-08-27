@@ -1,3 +1,9 @@
+"""
+memory/models.py — 记忆相关数据模型
+
+遵循 DimensionCoder 现有 dataclass 模式：@dataclass + to_dict()/from_dict()
+用于 REST API 返回值和内部传递。MemoryStorage 内部直接用 SQLite Row 操作。
+"""
 
 from __future__ import annotations
 
@@ -7,14 +13,18 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _gen_id() -> str:
     return uuid4().hex
 
+
 @dataclass
 class MemoryBank:
+    """Bank 定义——一个项目对应一个 bank。"""
 
     id: str
     name: str
@@ -47,23 +57,25 @@ class MemoryBank:
             updated_at=d.get("updated_at", ""),
         )
 
+
 @dataclass
 class MemoryFact:
+    """原始事实（memory unit）——LLM 提取的单条事实。"""
 
     id: str = ""
     bank_id: str = ""
-    fact_text: str = ""
-    fact_type: str = "world"
-    fact_kind: str = "conversation"
+    fact_text: str = ""  # 组合: "what | When: {when} | Involving: {who} | {why}"
+    fact_type: str = "world"  # "world" 或 "experience"
+    fact_kind: str = "conversation"  # "event" | "conversation"
     context: str = ""
     occurred_start: Optional[str] = None
     occurred_end: Optional[str] = None
-    mentioned_at: Optional[str] = None
+    mentioned_at: Optional[str] = None  # event_date，非 ingest 时间
     metadata: dict = field(default_factory=dict)
     chunk_id: Optional[str] = None
     document_id: Optional[str] = None
     tags: list = field(default_factory=list)
-    source_ref: dict = field(default_factory=dict)
+    source_ref: dict = field(default_factory=dict)  # {task_id, step_id}
     consolidated_at: Optional[str] = None
     created_at: str = ""
 
@@ -120,13 +132,15 @@ class MemoryFact:
             created_at=d.get("created_at", ""),
         )
 
+
 @dataclass
 class MemoryEntity:
+    """实体——人、系统、概念等。"""
 
     id: str = ""
     bank_id: str = ""
     canonical_name: str = ""
-    entity_kind: str = "regular"
+    entity_kind: str = "regular"  # "regular" 或 "label"
     metadata: dict = field(default_factory=dict)
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
@@ -163,13 +177,15 @@ class MemoryEntity:
             mention_count=d.get("mention_count", 0),
         )
 
+
 @dataclass
 class MemoryObservation:
+    """归纳后的观察——从多条 fact 合成的去重信念。"""
 
     id: str = ""
     bank_id: str = ""
     text: str = ""
-    proof_count: int = 1
+    proof_count: int = 1  # 支撑此 observation 的 fact 数
     source_fact_ids: list = field(default_factory=list)
     evidence_quotes: list = field(default_factory=list)
     scope_tags: list = field(default_factory=list)
@@ -221,13 +237,15 @@ class MemoryObservation:
             consolidated_at=d.get("consolidated_at"),
         )
 
+
 @dataclass
 class MentalModel:
+    """预计算常驻答案——后台自动刷新的记忆页面。"""
 
     id: str = ""
     bank_id: str = ""
     name: str = ""
-    source_query: str = ""
+    source_query: str = ""  # 生成此 model 的查询
     content: Optional[str] = None
     tags: list = field(default_factory=list)
     max_tokens: int = 2048
@@ -282,8 +300,10 @@ class MentalModel:
             created_at=d.get("created_at", ""),
         )
 
+
 @dataclass
 class Directive:
+    """硬规则——用户显式定义的指令，注入 reflect prompt。"""
 
     id: str = ""
     bank_id: str = ""
@@ -328,13 +348,18 @@ class Directive:
             updated_at=d.get("updated_at", ""),
         )
 
+
+# ── Recall 结果 ────────────────────────────────────────────
+
+
 @dataclass
 class RecallScores:
+    """每条记忆的检索评分明细。"""
 
     final: float = 0.0
-    reranker: Optional[float] = None
-    semantic: Optional[float] = None
-    keyword: Optional[float] = None
+    reranker: Optional[float] = None  # 0-1 或 None
+    semantic: Optional[float] = None  # cosine 0-1
+    keyword: Optional[float] = None  # BM25 ≥0
 
     def to_dict(self) -> dict:
         return {
@@ -344,11 +369,13 @@ class RecallScores:
             "keyword": self.keyword,
         }
 
+
 @dataclass
 class RecallResult:
+    """recall() 的返回结构。"""
 
-    results: list = field(default_factory=list)
-    trace: Optional[dict] = None
+    results: list = field(default_factory=list)  # list[dict] 含 fact 数据 + scores
+    trace: Optional[dict] = None  # 调试追踪
     entities: Optional[dict] = None
     chunks: Optional[dict] = None
     source_facts: Optional[dict] = None

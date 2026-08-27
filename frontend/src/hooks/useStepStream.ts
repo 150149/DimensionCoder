@@ -1,3 +1,13 @@
+// ═══════════════════════════════════════════════════════════════
+// useStepStream（WP4-2 §3.11）
+// 签名：useStepStream(taskId, stepId, handlers, matchStepId?)
+// 行为：按 §3.4 处理 SSE（M10：事件按 matchStepId 过滤，默认 stepId 相等；
+//       MonitorDetail 传 M4 双向匹配）；pendingEvents 缓冲与回放；组件卸载
+//       关闭 EventSource
+// 实现：handlers/matchStepId 经 ref + bridge 转发，父组件每次渲染内联创建
+//       新回调也不会导致 SSE 重连或回调过期；effect 仅随 taskId/stepId 重建
+// ═══════════════════════════════════════════════════════════════
+
 import {useEffect, useRef} from 'react'
 import {createStepStream, type StepStreamHandlers} from '../api/sse'
 
@@ -13,7 +23,7 @@ export function useStepStream(
   matchRef.current = matchStepId
 
   useEffect(() => {
-
+    // 转发桥：stream 生命周期内始终读取最新回调（避免回调过期）
     const bridge: StepStreamHandlers = {
       onStepStart: (e) => handlersRef.current.onStepStart?.(e),
       onChunk: (e) => handlersRef.current.onChunk?.(e),

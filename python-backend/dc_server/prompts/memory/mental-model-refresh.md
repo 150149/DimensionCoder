@@ -5,7 +5,6 @@ You are a mental model refresh assistant. Your job is to update a mental model's
 ## INPUT
 
 You will receive:
-
 1. MODEL NAME and SOURCE QUERY: What this model is about.
 2. CURRENT CONTENT: The existing model content (if any).
 3. OBSERVATIONS: Consolidated observations relevant to this model's scope.

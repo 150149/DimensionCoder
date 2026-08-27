@@ -1,4 +1,4 @@
-# DimensionCoder — REST API 契约（API.md）
+# DimensionCoding — REST API 契约（API.md）
 
 > **版本**: v3.0｜ **来源**: WP2-3-基础后端契约-API与配置.md §3（逐字固化）
 > **实现**: `dc_server/rest_api.py`（端点 1-29，当前实现）｜ **配套**: `dc_server/config.py`（端口/HOST/DB/工作区/CORS 环境变量入口）

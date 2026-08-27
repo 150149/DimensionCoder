@@ -1,6 +1,15 @@
+/* ═══════════════════════════════════════════════════════════════
+ * DimensionCoding Web — 全局样式（视觉产品化改版 v2，亮色现代简洁）
+ *
+ * 版本说明：v2 为产品化重写——在保留全部组件类名（e2e/单测依赖）与
+ * CSS 变量名（组件引用）的前提下，按 Linear/Vercel 现代简洁风重建
+ * 设计令牌与全部组件样式。单一亮色主题（用户明确不做暗色主题）。
+ * 原 v1 为旧 VS Code 插件 4 个 HTML 的逐字复刻（SWP4-A B7），
+ * 对照存档见 tests/visual/对照表.md（v2 起作废，判据由 e2e+人工复核替代）。
+ * ═══════════════════════════════════════════════════════════════ */
 
 :root {
-
+    /* 语义变量（名称与 v1 保持一致，组件 var() 引用兼容；值按 v2 令牌更新） */
     --bg: #f6f7f9;
     --bg-card: #ffffff;
     --text: #18181b;
@@ -25,7 +34,7 @@
     --thinking-color: #9ca3af;
     --code-bg: #f4f4f5;
     --monitor-accent: #7c3aed;
-
+    /* v2 新增令牌 */
     --bg-subtle: #fafafa;
     --accent-soft: #eef2ff;
     --accent-soft-border: #e0e7ff;
@@ -43,10 +52,13 @@
     box-sizing: border-box;
 }
 
+/* ── 布局 ── */
 html, body, #root {
     height: 100%;
 }
 
+/* #root 须为 flex 列容器：body>#root>.app-shell 三级 flex 链中，#root 若为 block，
+   .app-shell 的 flex:1 失效 → 高度跟随内容（溢出视口/收缩），页面不铺满 */
 #root {
     display: flex;
     flex-direction: column;
@@ -73,6 +85,7 @@ button {
     font-family: inherit;
 }
 
+/* Webkit 滚动条 */
 ::-webkit-scrollbar {
     width: 8px;
     height: 8px;
@@ -105,10 +118,14 @@ button {
     overflow: hidden;
 }
 
+/* 2026-08-25（移动端优化）：抽屉式侧栏汉堡按钮——桌面隐藏，<768px 显示 */
 .hamburger-btn {
     display: none;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 通用按钮（v2：替代组件内联按钮样式的统一类）
+ * ═══════════════════════════════════════════════════════════════ */
 .btn {
     display: inline-flex;
     align-items: center;
@@ -178,6 +195,9 @@ button {
     border-color: #fca5a5;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * Sidebar
+ * ═══════════════════════════════════════════════════════════════ */
 .sidebar {
     width: 288px;
     flex-shrink: 0;
@@ -215,14 +235,17 @@ button {
     display: flex;
     flex-direction: column;
     gap: 8px;
-
+    /* 2026-08-23（用户反馈）：卡片右缘与滚动条间隔 8px（不被挤压，与下方输入框对齐）
+       scrollbar-gutter: stable——滚动条始终占位（无内容也占），宽度稳定不抖动；
+       new-task-box 用 16px padding-right 补偿（8px 对齐 + 8px gutter） */
     padding-right: 8px;
     scrollbar-gutter: stable;
     scrollbar-width: thin;
-
+    /* 2026-08-23（用户反馈）：Firefox thin 滚动条默认深色——指定 thumb 浅灰 */
     scrollbar-color: #d4d4d8 transparent;
 }
 
+/* 定制滚动条 8px（与 new-task-box 补偿宽度一致；Windows 默认 15px+ 会错位） */
 .task-list::-webkit-scrollbar {
     width: 8px;
 }
@@ -262,6 +285,8 @@ button {
     box-shadow: var(--shadow-sm);
 }
 
+/* 2026-08-23（用户反馈）：任务卡左色条移除（不如不要）——st-paused/st-abandoned
+   仅保留 opacity 弱化（非色条）；class 拼接保留（无害，未来可复用） */
 .task-card.st-paused,
 .task-card.st-abandoned {
     opacity: 0.85;
@@ -308,6 +333,7 @@ button {
     min-width: 6px;
 }
 
+/* 2026-08-25：折叠段旁小徽标（+N）——mini 版本空间窄，折叠数量以徽标展示 */
 .mini-fold-badge {
     font-size: 9px;
     line-height: 1;
@@ -328,10 +354,14 @@ button {
     background: var(--orange);
 }
 
+/* 2026-08-23（用户确认）：停止=暂停——灰（#5c5c62 rgb(92,92,98)，用户指定与
+   侧栏分段一致；#3f3f46 用户反馈太深） */
 .seg-stopped {
     background: #5c5c62;
 }
 
+/* 2026-08-23（用户反馈）：任务暂停 → 下一个待执行步骤分段灰（暂停中断点可见，
+   与 seg-stopped 同色） */
 .seg-paused {
     background: #5c5c62;
 }
@@ -377,7 +407,8 @@ button {
 .new-task-box {
     border-top: 1px solid var(--border);
     padding-top: 12px;
-
+    /* 2026-08-23（用户反馈）：输入框/按钮右缘与卡片对齐——8px（对齐 task-list padding）
+       + 8px（补偿滚动条 gutter，task-list scrollbar-gutter: stable 定制 8px） */
     padding-right: 16px;
     margin-top: 10px;
     flex-shrink: 0;
@@ -437,6 +468,9 @@ button {
     cursor: not-allowed;
 }
 
+/* gear-btn 同时覆盖 a（设置 Link）与 button（刷新/重启）：a 默认 inline 无 padding，
+   不覆写会与 button 高度/基线不一致 → 设置按钮不在同一水平线；
+   border/background 与 .new-task-box button 保持一致（设置 a 标签不匹配 button 选择器） */
 .new-task-box .gear-btn {
     flex: 0 0 auto;
     padding: 8px 11px;
@@ -463,6 +497,7 @@ button {
     margin: 0;
 }
 
+/* ── Modal ── */
 .modal-overlay {
     display: none;
     position: fixed;
@@ -665,6 +700,9 @@ button {
     line-height: 1.7;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 进度轨道
+ * ═══════════════════════════════════════════════════════════════ */
 .progress-wrap {
     padding: 16px 24px 14px;
     border-bottom: 1px solid var(--border);
@@ -673,6 +711,7 @@ button {
     overflow-x: auto;
 }
 
+/* v2：进度条居左（步骤少时贴左，不居中/不靠右） */
 .progress-track {
     display: flex;
     align-items: center;
@@ -721,7 +760,8 @@ button {
 .pt-dot-gate {
     background: var(--orange);
     color: #fff;
-
+    /* 2026-08-23（用户需求）：待审批醒目——唯一带脉冲的非 active 态，
+       一眼锁定该处理哪个流程 */
     animation: pulse 2s infinite;
 }
 
@@ -735,6 +775,8 @@ button {
     color: #fff;
 }
 
+/* 2026-08-23（用户反馈）：任务暂停 → 下一个待执行步骤圆点灰（暂停中断点可见，
+   与 seg-paused 同色 #5c5c62） */
 .pt-dot-paused {
     background: #5c5c62;
     color: #fff;
@@ -800,6 +842,9 @@ button {
     background: var(--purple);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 流程总览（v2：流程图布局——节点连接线 + 并行并排；2026-08-23 去除阶段分组）
+ * ═══════════════════════════════════════════════════════════════ */
 .flow-area {
     flex: 1;
     overflow-y: auto;
@@ -829,6 +874,7 @@ button {
     width: 100%;
 }
 
+/* 节点间连接线（树状流程感；前序完成变绿；中点嵌 Monitor 圆钮） */
 .flow-link {
     display: flex;
     flex-direction: column;
@@ -849,6 +895,7 @@ button {
     background: var(--green);
 }
 
+/* 并行组：并排 */
 .flow-parallel-row {
     display: flex;
     gap: 12px;
@@ -906,12 +953,15 @@ button {
 }
 
 .flow-card.card-stopped {
-
+    /* 2026-08-23（用户确认）：停止=暂停——灰左条（#5c5c62，与顶栏/侧栏暂停同色） */
     border-color: #e4e4e7;
     border-left: 3px solid #5c5c62;
     background: #fafafa;
 }
 
+/* 2026-08-23（用户需求）：任务暂停 → pending 步骤卡片整体灰化——浅灰底 + 灰边框
+   + 弱化。2026-08-23 修正：opacity 透明叠加会让卡片与页面底色（#fafafa）融合——
+   改实色中灰底（#ececef）+ 去阴影，与白色普通卡一眼可辨 */
 .flow-card.card-paused {
     border-color: #d4d4d8;
     border-left: 3px solid #5c5c62;
@@ -1087,6 +1137,7 @@ button {
     background: var(--accent-hover);
 }
 
+/* 侧栏未启动卡片启动按钮（P0-5）：与 flow-card 同风格，小尺寸适配卡片 */
 .task-card .resume-btn {
     margin-top: 8px;
     font-size: 12px;
@@ -1108,6 +1159,7 @@ button {
     background: var(--accent-hover);
 }
 
+/* 总览页空步骤占位：初始编排进行中提示 */
 .orchestrating-hint {
     text-align: center;
     padding: 24px 0;
@@ -1131,6 +1183,7 @@ button {
     color: #e5534b;
 }
 
+/* 编排实时流（等待页 AI 编排状况展示：等宽小字 + 左对齐 + 滚动） */
 .orchestrating-hint .plan-stream {
     font-size: 12px;
     line-height: 1.6;
@@ -1155,6 +1208,7 @@ button {
     position: relative;
 }
 
+/* Monitor 圆钮：连接线中点（无文字，仅 eye 图标；completed 步骤专属） */
 .flow-link-btn {
     width: 18px;
     height: 18px;
@@ -1191,6 +1245,7 @@ button {
     margin: 0;
 }
 
+/* 编排圆钮（起点线，紫色 compass 与审查圆钮靛蓝区分） */
 .flow-link-plan .flow-link-btn {
     border-color: #ddd6fe;
     color: var(--purple);
@@ -1202,6 +1257,7 @@ button {
     box-shadow: 0 0 6px rgba(124, 58, 237, 0.4);
 }
 
+/* 产出报告节点：待生成态弱化（任务完成后恢复正常） */
 .flow-card.card-pending {
     opacity: 0.8;
 }
@@ -1242,6 +1298,7 @@ button {
     color: var(--text2);
 }
 
+/* v2：单行顶栏（标题+元信息左｜操作按钮+tab 右），压缩高度 */
 .top-bar {
     padding: 10px 24px;
     border-bottom: 1px solid var(--border);
@@ -1273,6 +1330,7 @@ button {
     gap: 14px;
 }
 
+/* StepDetail 顶栏（rail 版）：进度条贴左并占满剩余空间（不推右） */
 .top-bar-rail {
     justify-content: flex-start;
     gap: 20px;
@@ -1284,12 +1342,15 @@ button {
     margin: 0;
 }
 
+/* v2：顶栏按钮组 / tab 组 */
 .flow-actions {
     display: flex;
     gap: 8px;
     flex-wrap: nowrap;
 }
 
+/* 流程/代码 tab（总览页）与 对话/代码 tab（步骤详情页）：无空隙 segmented
+   标准控件——容器边框 + 内部按钮共享 1px 分隔线，无间隙；active 蓝底白字 */
 .flow-tabs, .seg-tabs {
     display: inline-flex;
     border: 1px solid var(--border);
@@ -1337,6 +1398,9 @@ button {
     margin-left: 6px;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 顶栏 / 内容区
+ * ═══════════════════════════════════════════════════════════════ */
 .top-bar {
     padding: 14px 24px 14px;
     border-bottom: 1px solid var(--border);
@@ -1391,6 +1455,8 @@ button {
     position: relative;
 }
 
+/* 2026-08-20：Monitor 顶栏（继承 .top-bar flex space-between）标题占满剩余空间
+   靠左——恢复按钮出现时不把标题挤到中间/右边 */
 .top-bar .step-header {
     flex: 1;
     min-width: 0;
@@ -1460,12 +1526,16 @@ button {
     border: 1px solid #ddd6fe;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 聊天流
+ * ═══════════════════════════════════════════════════════════════ */
 .chat-log {
     display: flex;
     flex-direction: column;
     gap: 12px;
 }
 
+/* 分页：历史折叠——「加载更早消息」按钮（getStep 默认最近 200 条） */
 .history-fold {
     display: flex;
     justify-content: center;
@@ -1602,6 +1672,7 @@ button {
     word-break: break-word;
 }
 
+/* 2026-08-22：系统注入上下文（step_context）Markdown 渲染（深色气泡适配） */
 .msg-user .user-bubble h1, .msg-user .user-bubble h2, .msg-user .user-bubble h3 {
     margin: 6px 0 4px;
     line-height: 1.5;
@@ -1637,6 +1708,7 @@ button {
     color: #c7d2fe;
 }
 
+/* 待发送气泡（发送后、AI 注入前）：半透明 + 虚线边框 + 发送中标识 */
 .user-bubble.sending {
     background: linear-gradient(135deg, rgba(79, 70, 229, 0.55), rgba(99, 102, 241, 0.55));
     border: 1.5px dashed rgba(255, 255, 255, 0.7);
@@ -1764,6 +1836,7 @@ button {
     text-decoration: underline;
 }
 
+/* GFM 表格（2026-08-23 用户要求：markdown 表格加边框，StepDetail/MonitorDetail 共用） */
 .ai-text table, .user-bubble table, .gate-review-info table {
     border-collapse: collapse;
     margin: 8px 0;
@@ -1787,6 +1860,8 @@ button {
     white-space: nowrap;
 }
 
+/* 深色气泡（step_context 蓝底 + 白字）内表格适配（2026-08-23：表头用浅色
+   code-bg 会白底白字看不清——改半透明白底 + 半透明白边框，继承白色文字） */
 .msg-user .user-bubble table {
     border-collapse: collapse;
     margin: 6px 0;
@@ -1808,6 +1883,7 @@ button {
     white-space: nowrap;
 }
 
+/* ── 工具卡 ── */
 .tool-panel {
     border: 1px solid var(--tool-border);
     border-radius: var(--radius);
@@ -1842,7 +1918,7 @@ button {
     font-weight: 400;
     flex: 1;
     min-width: 0;
-
+    /* 摘要完整可见（v2 修订：不再单行 nowrap 省略，最多两行，长路径也能读全） */
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
@@ -1917,6 +1993,7 @@ button {
     overflow-y: auto;
 }
 
+/* AI 块内联工具 */
 .ai-tool-inline {
     margin: 2px 0;
 }
@@ -2007,6 +2084,7 @@ button {
     overflow-y: auto;
 }
 
+/* ── 思考块 ── */
 .ai-thinking-inline {
     margin: 2px 0;
 }
@@ -2066,14 +2144,17 @@ button {
     line-height: 1.55;
 }
 
+/* ── 聊天流「回到底部」悬浮按钮（常驻，sticky 贴滚动容器右下角） ── */
 .scroll-jump-btn {
-
+    /* sticky：absolute 在滚动容器（.content-area overflow:auto + relative）内
+       定位基准是滚动坐标系，按钮随内容滚动——滚动到中间时跑到视口外看不见；
+       sticky 则粘在滚动容器可视区底部，任何滚动位置都悬浮可见 */
     position: sticky;
     bottom: 18px;
     right: 22px;
     z-index: 10;
-    align-self: flex-end;
-    flex-shrink: 0;
+    align-self: flex-end; /* flex column 容器：横向贴右侧 */
+    flex-shrink: 0; /* 主轴方向防压缩（否则被 flex-shrink 压扁成椭圆） */
     width: 34px;
     height: 34px;
     border-radius: 50%;
@@ -2099,6 +2180,7 @@ button {
     border-color: var(--accent);
 }
 
+/* ── 人工审批区域（步骤详情页 gate 待审批步骤；人类决策点） ── */
 .gate-review-card {
     border: 1px solid #fcd34d;
     border-left: 3px solid var(--orange);
@@ -2145,6 +2227,7 @@ button {
     gap: 8px;
 }
 
+/* ── G3c：聊天流内决策请求包详细卡片（AI 直接在聊天中输出的完整内容，全展开） ── */
 .decision-card {
     border: 1px solid var(--border);
     border-left: 3px solid var(--accent);
@@ -2177,10 +2260,12 @@ button {
     word-break: break-word;
 }
 
+/* G3d：审批操作区跟随最后一条决策包（看完就地拍板） */
 .gate-action-card .gate-options {
     margin-top: 8px;
 }
 
+/* G3e：硬编码「自定义方向」输入框（不限于 AI 选项，用户直接输入决策） */
 .gate-custom {
     margin-top: 10px;
 }
@@ -2211,6 +2296,7 @@ button {
     border-color: var(--accent);
 }
 
+/* ── G3b：决策请求包结构化展示（背景折叠 / 选项卡片 / 推荐条 / 待答问题） ── */
 .gate-detail {
     font-size: 12.5px;
     color: var(--text2);
@@ -2321,6 +2407,7 @@ button {
     color: var(--text);
 }
 
+/* ── 状态标签 ── */
 .chat-status {
     color: var(--muted);
     padding: 24px;
@@ -2351,6 +2438,7 @@ button {
     background: var(--border);
 }
 
+/* ── 流式指示 / 加载 ── */
 .stream-cursor {
     display: inline-block;
     width: 2px;
@@ -2383,6 +2471,7 @@ button {
     margin-right: 7px;
 }
 
+/* ── 编排模态（v2：创建流程时 AI 思考实时展示；遮罩阻止用户操作） ── */
 .planning-overlay {
     position: fixed;
     inset: 0;
@@ -2447,6 +2536,7 @@ button {
     gap: 6px;
 }
 
+/* ── LLM 错误卡 ── */
 .llm-error-card {
     margin: 12px 0;
     padding: 14px 16px;
@@ -2525,6 +2615,7 @@ button {
     color: #d97706;
 }
 
+/* ── Monitor 决策卡 ── */
 .decision-card {
     background: #f5f3ff;
     border: 1px solid #ddd6fe;
@@ -2550,6 +2641,7 @@ button {
     white-space: pre-wrap;
 }
 
+/* 流程/代码视图容器（v2：替代 FlowOverview 布局内联） */
 .flow-view {
     display: flex;
     flex: 1;
@@ -2567,16 +2659,20 @@ button {
     position: relative;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * Token 用量展示（TokenUsageBar）：输入框上方上下文占用 + 下方 token 明细
+ * 参照 Cursor/Claude Code 惯例：11px 小字号、tabular-nums 等宽数字、4px 细进度条
+ * ═══════════════════════════════════════════════════════════════ */
 .ctx-row {
     display: flex;
     align-items: center;
     gap: 8px;
     line-height: 18px;
     font-size: 11px;
-    font-variant-numeric: tabular-nums;
+    font-variant-numeric: tabular-nums; /* 等宽数字：数值跳动不抖版 */
     color: var(--muted);
     user-select: none;
-    padding: 8px 20px 0;
+    padding: 8px 20px 0; /* 上条：贴介入栏上方 */
     background: var(--bg-card);
 }
 
@@ -2614,7 +2710,7 @@ button {
     font-variant-numeric: tabular-nums;
     color: var(--muted);
     user-select: none;
-    padding: 0 20px 8px;
+    padding: 0 20px 8px; /* 下条：贴介入栏下方 */
     background: var(--bg-card);
 }
 
@@ -2637,6 +2733,7 @@ button {
     opacity: 0.6;
 }
 
+/* 占位横线：比明细 dim 再淡一档，不抢视线 */
 .tus-metric-sep {
     color: var(--muted);
     margin: 0 2px;
@@ -2655,10 +2752,12 @@ button {
     color: #10b981;
 }
 
+/* 缓存命中=省钱语义：绿 */
 .tus-dim {
     color: var(--muted);
 }
 
+/* 窄屏：明细行允许换行（缓存占比独立成行），上条保持单行 */
 @media (max-width: 480px) {
     .tus-row {
         flex-wrap: wrap;
@@ -2666,6 +2765,9 @@ button {
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 介入栏
+ * ═══════════════════════════════════════════════════════════════ */
 .intervene-bar {
     padding: 12px 20px;
     border-top: 1px solid var(--border);
@@ -2682,6 +2784,9 @@ button {
     align-items: flex-end;
 }
 
+/* 2026-08-20：按钮组与输入框底部对齐（原 center 居中导致上下都不齐、一大一小）；
+   按钮固定 32x32 方形 + 禁止压缩——对齐时不会拉伸成高大于宽的竖条 */
+/* 待发送区（v2：运行中且有输入时显示——排队入口 + 取消） */
 .pending-msg {
     display: flex;
     align-items: center;
@@ -2759,6 +2864,7 @@ button {
     gap: 8px;
 }
 
+/* v2：图标按钮统一 32px 方形圆角（无文字，title 提示）；flex-shrink:0 防对齐拉伸 */
 .intervene-bar button {
     width: 32px;
     height: 32px;
@@ -2787,6 +2893,7 @@ button {
     margin-right: 0;
 }
 
+/* v2 按钮层级：发送=主操作（实底靛蓝）；强制/打断/恢复/压缩=次级描边 */
 .intervene-bar button.send-btn {
     background: var(--accent);
     color: #fff;
@@ -2840,6 +2947,7 @@ button {
     border-color: #c7d2fe;
 }
 
+/* 压缩按钮（v2：介入栏内次级按钮，不再绝对定位右上角） */
 .compress-btn {
     padding: 7px 12px;
     font-size: 12.5px;
@@ -2863,6 +2971,7 @@ button {
     margin-right: 5px;
 }
 
+/* 自动滚动开关（输入框旁/顶栏）：开=锁定跟随（高亮），关=自由滚动（灰态） */
 .autoscroll-toggle {
     padding: 7px 12px;
     font-size: 12.5px;
@@ -2891,6 +3000,8 @@ button {
     border-color: #c7d2fe;
 }
 
+/* 暂停/恢复 toggle（步骤详情页顶栏右侧）：视觉对齐总览页 .btn 规格；
+   active=暂停（accent 蓝强调，同 .btn-accent），stopped=恢复（灰白），其他禁用 */
 .run-toggle-btn {
     display: inline-flex;
     align-items: center;
@@ -2907,7 +3018,7 @@ button {
     transition: all 0.15s ease;
     white-space: nowrap;
     line-height: 1.4;
-    flex-shrink: 0;
+    flex-shrink: 0; /* 顶栏 flex 布局：防被 ProgressRail 挤压 */
 }
 
 .run-toggle-btn:hover:not(:disabled) {
@@ -2935,6 +3046,8 @@ button {
     border-color: #a5b4fc;
 }
 
+/* 尽力模式开关（2026-08-16 用户需求）：总览页 flow-actions 与详情页顶栏同款——
+   关闭=灰白（同 .btn），开启=accent 绿强调 + 圆点填充；圆点指示开关状态 */
 .best-effort-toggle {
     display: inline-flex;
     align-items: center;
@@ -2978,6 +3091,7 @@ button {
     box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
 }
 
+/* ConfirmDialog 说明文案（如重置流程后果提示） */
 .modal-desc {
     font-size: 12.5px;
     color: var(--muted);
@@ -2989,6 +3103,9 @@ button {
     border: 1px solid var(--border);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 全局错误提示 ErrorToast
+ * ═══════════════════════════════════════════════════════════════ */
 .error-toast {
     position: fixed;
     top: 14px;
@@ -3022,6 +3139,9 @@ button {
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 设置页（v2：迁移 SettingsPage 内联样式为 class）
+ * ═══════════════════════════════════════════════════════════════ */
 .settings-form {
     display: flex;
     flex-direction: column;
@@ -3081,6 +3201,9 @@ button {
     background: var(--bg-subtle);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 文件树 + 编辑器（v2：迁移 FileTree/CodeEditor 内联样式为 class）
+ * ═══════════════════════════════════════════════════════════════ */
 .file-tree {
     width: 264px;
     min-width: 264px;
@@ -3245,8 +3368,12 @@ button {
     color: var(--muted);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * 移动端优化（2026-08-25）：768px 断点——抽屉式侧栏/分栏单列/
+ * 触控目标加大/safe-area 适配（手机+平板）
+ * ═══════════════════════════════════════════════════════════════ */
 @media (max-width: 768px) {
-
+    /* 侧边栏 → 抽屉（默认隐藏，汉堡展开；backdrop 由组件在 open 时渲染） */
     .sidebar {
         position: fixed;
         left: 0;
@@ -3263,6 +3390,8 @@ button {
         transform: translateX(0);
     }
 
+    /* 2026-08-25（移动端 UI）：隐藏态去阴影——translateX(-100%) 后元素虽在屏外，
+       但 64px 模糊阴影仍向屏幕内扩散 → 左缘一条阴影；仅 open 才投影 */
     .sidebar:not(.open) {
         box-shadow: none;
     }
@@ -3278,6 +3407,7 @@ button {
         width: 100%;
     }
 
+    /* 汉堡按钮：左上固定（z-index 低于抽屉、高于内容） */
     .hamburger-btn {
         display: flex;
         position: fixed;
@@ -3295,6 +3425,9 @@ button {
         box-shadow: var(--shadow-sm);
     }
 
+    /* 2026-08-25（移动端 UI）：顶栏两行结构——行1 标题（左）｜行2 操作按钮
+       （右对齐），替代原来多按钮互相挤压竖排堆叠（实证：FlowOverview h=221、
+       StepDetail h=152 乱排）；汉堡让位 padding-left 52px 保留 */
     .top-bar {
         flex-wrap: wrap;
         gap: 6px 8px;
@@ -3307,11 +3440,13 @@ button {
         flex-wrap: nowrap;
     }
 
+    /* 标题可收缩省略（min-width:auto 默认不缩 → meta 被挤换行撑高标题行） */
     .tb-title-group .task-header {
         flex-shrink: 1;
         min-width: 0;
     }
 
+    /* 标题行紧凑：类型/状态 meta 与标题同行省略（修复前换行撑高标题行） */
     .tb-title-group .task-meta {
         white-space: nowrap;
         overflow: hidden;
@@ -3332,6 +3467,9 @@ button {
         gap: 3px;
     }
 
+    /* 2026-08-25（移动端 UI 二轮）：操作按钮压缩放一行（修复前 flow-actions +
+       flow-tabs 两行 h=88；再修：5 按钮 right=408 溢出视口——padding/字号/图标
+       齐缩至 274px ≤ 299 可用宽） */
     .tb-tools .btn,
     .tb-tools .tab-btn {
         padding: 5px 7px;
@@ -3348,6 +3486,9 @@ button {
         flex-shrink: 0;
     }
 
+    /* top-bar-rail（StepDetail）：order 重排——行1 = back-btn + seg-tabs（右推）；
+       行2 = 恢复/尽力按钮 + progress-track（占满剩余可横向滚动）。修复前：
+       back-btn 被压到 32px 文字竖排、progress-track 被挤成 w=0 不可见 */
     .top-bar-rail {
         gap: 6px 20px;
     }
@@ -3361,18 +3502,17 @@ button {
     .top-bar-rail .best-effort-toggle {
         order: 2;
     }
-
     .top-bar-rail .seg-tabs {
         order: 3;
         margin-left: auto;
     }
-
     .top-bar-rail .progress-track {
         order: 4;
         flex: 1 1 100%;
         min-width: 0;
     }
 
+    /* rail 行1 三元素同行压缩（修复前 back+尽力+seg-tabs 355px 超宽 seg 掉行2） */
     .top-bar-rail {
         gap: 6px 10px;
     }
@@ -3389,10 +3529,13 @@ button {
         min-height: 36px;
     }
 
+    /* 2026-08-25（移动端 UI 三轮）：行1 三元素与汉堡按钮同高同水平线——
+       汉堡 fixed top 8→14（行1 中心 y≈32 对齐），各元素 min-height 统一 36 */
     .hamburger-btn {
         top: 14px;
     }
 
+    /* 代码/流程分栏 → 单列堆叠（每块 ≥40vh 保证可见高度） */
     .flow-code-split {
         flex-direction: column;
     }
@@ -3401,6 +3544,7 @@ button {
         min-height: 40vh;
     }
 
+    /* 触控目标 ≥40px（手机拇指友好） */
     .btn,
     .tab-btn,
     .seg-btn,
@@ -3412,6 +3556,8 @@ button {
         padding: 8px 16px;
     }
 
+    /* 2026-08-25（移动端 UI 二轮）：按钮统一有边框（修复前 tab/seg 无边框、
+       back 是裸链接）——tab/seg 保留连体效果，back 按钮化 */
     .flow-tabs .tab-btn,
     .seg-tabs .seg-btn {
         border: 1px solid var(--border);
@@ -3432,6 +3578,8 @@ button {
         margin: 0;
     }
 
+    /* 2026-08-25（移动端 UI 三轮）：MonitorDetail 顶栏单行——返回 + 标题
+       （省略号）+ Monitor Agent 徽章 + 恢复按钮同行；徽章缩小并与行1 同高 */
     .top-bar-monitor {
         flex-wrap: nowrap;
         align-items: center;
@@ -3449,7 +3597,6 @@ button {
         flex: 1;
         min-width: 0;
     }
-
     .top-bar-monitor .monitor-title {
         flex: 1;
         min-width: 0;
@@ -3458,7 +3605,6 @@ button {
         text-overflow: ellipsis;
         font-size: 12px;
     }
-
     .top-bar-monitor .monitor-badge {
         flex-shrink: 0;
         height: 28px;
@@ -3473,6 +3619,8 @@ button {
         flex-shrink: 0;
     }
 
+    /* 2026-08-25（移动端 UI 三轮）：token 栏两行紧凑（字号 10/行高 14，
+       item 行 + metrics 行各单行不溢出） */
     .tus-row {
         flex-wrap: wrap;
         gap: 2px;
@@ -3489,6 +3637,8 @@ button {
         gap: 2px;
     }
 
+    /* 2026-08-25（移动端 UI 二轮）：介入栏——输入框 1 行（40px）+ 按钮组
+       同行同高（修复前输入框全宽行+按钮行分离） */
     .intervene-row {
         flex-wrap: nowrap;
         align-items: stretch;
@@ -3513,11 +3663,14 @@ button {
         height: 40px;
     }
 
+    /* 2026-08-25（移动端 UI 二轮）：聊天长内容换行（修复前 user-bubble
+       sw=508 溢出 → chat-log 横向滚动条） */
     .chat-log :is(.user-bubble, .ai-text, .think-body, .ai-tool-inline) {
         overflow-wrap: anywhere;
         word-break: break-word;
     }
 
+    /* 用户消息内 markdown 表格窄屏自适应（修复前 table sw=475 不收缩溢出） */
     .user-bubble table {
         table-layout: fixed;
         width: 100%;
@@ -3529,24 +3682,30 @@ button {
         word-break: break-word;
     }
 
+    /* 表头换行（修复前 th white-space:nowrap 撑宽表格 → chat-log 横向滚动） */
     .msg-user .user-bubble th {
         white-space: normal;
     }
 
+    /* iPhone 底部安全区（home 指示条） */
     .step-footer {
         padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     }
 
+    /* 对话框窄屏全宽留边（原 92% 在 375px 下剩 30px 边距，统一 16px） */
     .modal {
         width: calc(100% - 32px);
     }
 
+    /* 聊天/流程区滚动回弹防页面连动 */
     .chat-log,
     .flow-area {
         overscroll-behavior: contain;
     }
 
+    /* 进度条窄屏密度 */
     .progress-wrap {
         padding: 12px 14px 10px;
     }
 }
+

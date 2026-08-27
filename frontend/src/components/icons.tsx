@@ -1,3 +1,11 @@
+// ═══════════════════════════════════════════════════════════════
+// icons.tsx — 自建 SVG 图标集（视觉产品化改版 v2）
+// - 零 npm 依赖：内联 SVG，stroke=currentColor，颜色跟随 CSS color
+// - 断网可用（P1-6）：随 bundle 打包，无外部资源
+// - 用法：<Icon name="play" size={14} />；可传标准 svg 属性（className 等）
+// - 风格：Linear 系 24x24 线性图标（strokeWidth 2，圆角端点）
+// ═══════════════════════════════════════════════════════════════
+
 import type {CSSProperties, ReactNode, SVGProps} from 'react'
 
 export type IconName =
@@ -210,7 +218,7 @@ const PATHS: Record<IconName, ReactNode> = {
 interface IconProps extends SVGProps<SVGSVGElement> {
     name: IconName
     size?: number
-
+    /** 图标与相邻文本的间距（默认 5px） */
     gap?: number
     style?: CSSProperties
 }
@@ -235,6 +243,7 @@ export function Icon({name, size = 14, gap = 5, style, ...rest}: IconProps) {
     )
 }
 
+/** 任务类型 → 图标名（Sidebar typeIcon 的 SVG 版） */
 export const TYPE_ICON_NAMES: Record<string, IconName> = {
     'dev-full-flow': 'rocket',
     'small-change': 'wrench',
@@ -250,6 +259,7 @@ export function typeIconName(type: string): IconName {
     return TYPE_ICON_NAMES[type] ?? 'bookmark'
 }
 
+/** 工具名 → 图标名（ToolCard 的 emoji 映射表 SVG 版） */
 export const TOOL_ICON_NAMES: Record<string, IconName> = {
     list_dir: 'folder',
     read_file: 'file',
@@ -265,7 +275,7 @@ export const TOOL_ICON_NAMES: Record<string, IconName> = {
 }
 
 export function toolIconName(name: string): IconName {
-
+    // 兼容带/不带 dcflow_ 前缀（真实 DB tool_name 带前缀，映射表为无前缀键）
     const key = name.startsWith('dcflow_') ? name.slice(7) : name
     return TOOL_ICON_NAMES[key] ?? 'wrench'
 }

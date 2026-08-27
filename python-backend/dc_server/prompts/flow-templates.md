@@ -105,7 +105,7 @@ executor）、description（给步骤执行者的详细指令——必须写清�
   修复方式）。
 - cr-r2「独立审查（第 2 轮）」required=1 model_tier=power human_attention=none type=code_review description: 同款描述独立复查（不参考第 1 轮结论），输出 [R2-N] 问题清单；两轮问题清单由系统 final-report 汇总呈现。
 
-## 模板 7：doc-update（文档更新）
+## 模板 7：doc-update（文档更新
 
 适用场景：业务知识文档创建/更新。先人工审批变更方案再修改（不是改完再审查）。
 

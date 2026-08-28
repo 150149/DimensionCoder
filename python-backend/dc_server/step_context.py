@@ -241,8 +241,12 @@ class StepContext:
                 f"## 任务工作目录\n"
                 f"本任务工作区（相对路径基于此目录解析，持久化产物写这里）:\n"
                 f"  {ws}\n"
-                f"相对路径（如 src/x.py、docs/plan.md）基于此目录解析；\n"
-                f".dc_tmp 临时文件用绝对路径引用（dcflow_read_file / run_cmd）\n\n"
+                f"- 代码/脚本等持久化产物：用相对路径（如 src/x.py），基于此目录解析\n"
+                f"- 方案/报告等步骤产物：dcflow_write_file 传以 .dc_tmp/ 开头的完整相对路径\n"
+                f"  （.dc_tmp/{task_id}/{step_id}/artifacts/xxx.md）——系统特判解析到服务端\n"
+                f"  工作区 {PROJECT_ROOT}/.dc_tmp/，与本任务工作区无关；目录自动创建，无需手动建\n"
+                f"- dcflow_run_cmd 的工作目录是本任务工作区：引用 .dc_tmp 下文件需用绝对路径\n"
+                f"  {PROJECT_ROOT}/.dc_tmp/{task_id}/{step_id}/...（或先 cd 到该目录）\n\n"
             )
         if prev_summaries:
             step_context += (
@@ -314,30 +318,6 @@ class StepContext:
                 f"（用 dcflow_read_file 读取对应规则文件；找不到时用 dcflow_list_dir "
                 f"在项目内搜索 rules 目录）\n\n"
             )
-
-        # 2026-08-25（Hindsight 记忆模块 B-3）：注入项目记忆（recall）——
-        # enabled 时从记忆库检索与步骤相关的历史结论；disabled/异常全部静默跳过
-        try:
-            from .config import get_memory_config
-            mem_cfg = get_memory_config()
-            if mem_cfg.get("enabled"):
-                from .rest_api import _get_memory_storage
-                ms = _get_memory_storage()
-                if ms is not None:
-                    bank_id = ms.get_or_create_bank_for_project(PROJECT_ROOT)
-                    from .memory import get_recaller
-                    recaller = get_recaller(ms, mem_cfg)
-                    recall_result = await recaller.recall(
-                        bank_id=bank_id,
-                        query=f"{step.get('title', '')} {task.get('description') or ''}",
-                        max_tokens=mem_cfg.get("recall_max_tokens", 4096),
-                        budget="low",
-                    )
-                    mem_text = ms.format_recall_for_prompt(recall_result)
-                    if mem_text:
-                        step_context += f"\n\n## 项目记忆（来自历史任务）\n{mem_text}\n"
-        except Exception:
-            logger.warning("[DC:stepctx] memory recall skipped (disabled or error)", exc_info=True)
 
         # 向后兼容：合并为一个 system_message（契约端点 8 B5：拼装后完整值，
         # 供展示/旧调用方；LLM 调用应使用 system_prompt + step_context 拆分结构，

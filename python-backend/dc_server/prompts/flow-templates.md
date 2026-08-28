@@ -26,7 +26,7 @@ executor）、description（给步骤执行者的详细指令——必须写清�
   期望结果）组合序列构成的，逐条列出全部旅程，覆盖所有需求场景。产出需求理解摘要：用户期望什么、涉及哪些模块、有哪些模糊点需要后续澄清。随后调用 dcflow_search_code/dcflow_read_file 梳理现有逻辑，**表格列出与当前实现不一致的地方**，逐条标注：与用户新预期的差异点、根因。
 - step-2「方案设计」required=1 model_tier=power human_attention=none type=plan description: 基于 step-1 的用户旅程与差异分析设计修改方案：**对每个有差异的用户旅程逐条列出**根因、差异点、实现复杂度、验证方式、修改代码的位置与大致逻辑（每条差异点一行）；**
   并为每个用户旅程设计测试方案**（正向/边界/异常）。提出 **2-3 个整体修改方案**，对比各方案的优缺点、影响范围、风险，给出推荐方案及理由。产出方案文档到步骤产物（file_path 传完整相对路径：以 `.dc_tmp/` 开头、包含「任务ID/步骤ID/artifacts/」目录，如
-  step2_refactor_plan.md；裸相对路径会被拒绝），供 step-3 展示与后续步骤照做。
+  step2_refactor_plan.md；裸相对路径会被拒绝——系统特判解析到服务端工作区，目录自动创建，无需手动建），供 step-3 展示与后续步骤照做。
 - step-3「方案审批」required=1 model_tier=power human_attention=gate type=gate description: **仅将 step-2 产出的方案文档读取出来**（dcflow_read_file）整理成**方案审批报告**
   展示给用户审批——完整呈现方案文档内容（根因条目/测试方案/决策点逐条保留，禁止摘要化压缩），**不重复设计方案、不修改方案内容**。此为 Gate 步骤：等待人类在步骤详情页确认后进入实现。
 - step-4「编写测试代码」required=1 model_tier=power human_attention=none description: 根据 step-2 测试方案编写可运行的测试代码（每个用户旅程对应测试用例），覆盖正向、边界、异常场景，确保关键路径有测试，测试代码先行落地。
@@ -47,7 +47,8 @@ executor）、description（给步骤执行者的详细指令——必须写清�
 步骤设计（4 步，含 1 个方案审批 gate）：
 
 - step-1「问题定位与方案设计」required=1 model_tier=power human_attention=none type=plan description: 复现问题，**以表格列出与预期行为的差异点**（差异点/根因/涉及模块逐条），**直接给出修改方案**
-  ：对每个差异点逐条列出修改内容、影响范围、验证方式——一步兼顾定位与方案设计。产出方案文档到步骤产物（file_path 传完整相对路径：以 `.dc_tmp/` 开头、包含「任务ID/步骤ID/artifacts/」目录，如 step1_fix_plan.md；裸相对路径会被拒绝），供 step-2 展示与后续步骤照做。
+  ：对每个差异点逐条列出修改内容、影响范围、验证方式——一步兼顾定位与方案设计。产出方案文档到步骤产物（file_path 传完整相对路径：以 `.dc_tmp/` 开头、包含「任务ID/步骤ID/artifacts/」目录，如 step1_fix_plan.md；裸相对路径会被拒绝——系统特判解析到服务端工作区，目录自动创建，无需手动建），供
+  step-2 展示与后续步骤照做。
 - step-2「方案审批」required=1 model_tier=power human_attention=gate type=gate description: **仅将 step-1 产出的方案文档读取出来**（dcflow_read_file）整理成**方案审批报告**
   展示给用户审批——完整呈现方案文档内容（差异点/修改内容/验证方式逐条保留，禁止摘要化压缩），**不重复设计方案、不修改方案内容**。此为 Gate 步骤：等待人类审批通过后进入实现。
 - step-3「代码修改与验证」required=1 model_tier=power human_attention=none description: 按批准方案修改代码（调用 dcflow_write_file/dcflow_edit_file，修改项目文件用绝对路径），运行编译与相关测试确认无回归，失败则修复后重新验证。
@@ -76,7 +77,7 @@ executor）、description（给步骤执行者的详细指令——必须写清�
 步骤设计（4 步，含 1 个方案审批 gate）：
 
 - step-1「根因定位与修复方案」required=1 model_tier=power human_attention=none type=plan description: 复现验证问题，**以表格列出根因证据**（证据/根因/影响逐条），**直接给出修复方案**
-  ：修复内容、影响范围、验证方式——一步兼顾定位与方案设计。产出修复方案文档到步骤产物（file_path 传完整相对路径：以 `.dc_tmp/` 开头、包含「任务ID/步骤ID/artifacts/」目录，如 step1_fix_plan.md；裸相对路径会被拒绝），供 step-2 展示。
+  ：修复内容、影响范围、验证方式——一步兼顾定位与方案设计。产出修复方案文档到步骤产物（file_path 传完整相对路径：以 `.dc_tmp/` 开头、包含「任务ID/步骤ID/artifacts/」目录，如 step1_fix_plan.md；裸相对路径会被拒绝——系统特判解析到服务端工作区，目录自动创建，无需手动建），供 step-2 展示。
 - step-2「方案审批」required=1 model_tier=power human_attention=gate type=gate description: **仅将 step-1 产出的修复方案文档读取出来**（dcflow_read_file）整理成**方案审批报告**
   展示给用户审批——完整呈现方案文档内容（根因证据/修复内容/影响范围逐条保留，禁止摘要化压缩），**不重复设计方案、不修改方案内容**。此为 Gate 步骤：等待人类审批通过后进入修复（紧急场景人工快速确认）。
 - step-3「代码修复与快速验证」required=1 model_tier=power human_attention=none description: 按批准方案修复代码（调用 dcflow_write_file/dcflow_edit_file，修改项目文件用绝对路径），运行编译与回归测试确认修复生效。
@@ -112,7 +113,7 @@ executor）、description（给步骤执行者的详细指令——必须写清�
 步骤设计（3 步，含 1 个方案审批 gate）：
 
 - step-1「文档变更方案」required=1 model_tier=power human_attention=none type=plan description: 明确文档目标与涉及模块，阅读现有文档与相关代码，**以表格列出变更内容**（变更点/内容/涉及文件逐条），给出变更方案。产出变更方案文档到步骤产物（file_path
-  传完整相对路径：以 `.dc_tmp/` 开头、包含「任务ID/步骤ID/artifacts/」目录，如 step1_doc_plan.md；裸相对路径会被拒绝），供 step-2 展示。
+  传完整相对路径：以 `.dc_tmp/` 开头、包含「任务ID/步骤ID/artifacts/」目录，如 step1_doc_plan.md；裸相对路径会被拒绝——系统特判解析到服务端工作区，目录自动创建，无需手动建），供 step-2 展示。
 - step-2「方案审批」required=1 model_tier=power human_attention=gate type=gate description: **仅将 step-1 产出的变更方案文档读取出来**（dcflow_read_file）整理成**方案审批报告**
   展示给用户审批——完整呈现变更内容（变更点/涉及文件逐条保留，禁止摘要化压缩），**不重复设计方案、不修改方案内容**。此为 Gate 步骤：等待人类审批通过后进入更新。
 - step-3「更新文档」required=1 model_tier=power human_attention=none description: 按批准方案编写/更新文档（写前自检 R1-R11 规则；修改项目内文档文件用绝对路径，裸相对路径会被拒绝）。

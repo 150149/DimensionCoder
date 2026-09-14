@@ -1,0 +1,35 @@
+# DimensionCoder .gitignore
+
+# Configuration files (contains real API keys, do not commit)
+config.json
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+python-backend/data/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+
+# workspace temporary files
+.dc_tmp/
+
+# Node.js (managed by frontend/.gitignore)
+# node_modules/ and dist/ are handled by frontend/.gitignore
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# TLS self-signed certs (private key must not be committed)
+certs/

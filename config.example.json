@@ -1,0 +1,30 @@
+{
+	"lightModel": "deepseek-v4-flash",
+	"powerModel": "glm-5.2",
+	"projectRoot": "E:\\workspace",
+	"contextWindow": 1048576,
+	"lightBaseUrl": "https://api.deepseek.com/v1",
+	"powerBaseUrl": "https://api.deepseek.com/v1",
+	"lightApiKey": "sk-123456",
+	"powerApiKey": "sk-123456",
+	"lightModel2": "",
+	"lightBaseUrl2": "",
+	"lightApiKey2": "",
+	"lightInputPrice": 3,
+	"lightCachedPrice": 0.1,
+	"lightOutputPrice": 9,
+	"powerInputPrice": 8,
+	"powerCachedPrice": 2,
+	"powerOutputPrice": 28,
+	"https": {
+		"enabled": true,
+		"certFile": "certs/server.crt",
+		"keyFile": "certs/server.key"
+	},
+	"auth": {
+		"enabled": false,
+		"sessionHours": 8,
+		"challengeTtlSec": 300,
+		"publicKeys": []
+	}
+}

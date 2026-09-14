@@ -1,0 +1,3 @@
+# SWP4-A：前端构建产物与依赖不入库（守则 §8.2；交付运行时零 Node，v3.0）
+node_modules/
+dist/

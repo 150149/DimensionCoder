@@ -9,8 +9,9 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,14 +24,15 @@ from .config import DB_PATH, PROJECT_ROOT, CORS_ORIGINS
 from .storage import create_storage, StorageAdapter
 from .state_machine.state_machine import StateMachine
 from .monitor_context import MonitorContext
-from .step_context import (StepContext, get_task_workspace, strip_key_findings_block,
+from .step_context import (StepContext, get_step_temp_dir, get_task_workspace,
+                           strip_key_findings_block,
                            STEP_TYPE_MODEL_TIER as _STEP_TYPE_MODEL_TIER,
                            compute_task_score, validate_score_params,
                            score_context_section,
                            CODE_DIAGRAM_ASSET, get_project_key, get_project_path,
                            load_project_asset)
-from .prompts import load_prompt, rules_dir
-from .prompts.registry import is_hidden_step, is_virtual_step, prompt_for_step
+from .prompts import load_prompt, rules_dir, templates_dir
+from .prompts.registry import is_hidden_step, is_virtual_step, prompt_for_step, load_role_prompt
 from .tool_security import safe_resolve
 from .graceful import graceful
 from .brain.orchestrator import (Orchestrator, OrchestratorBusyError, _StepGracefulDrain,
@@ -151,6 +153,9 @@ async def create_task(payload: dict):
     task_type = payload.get("task_type", "custom")
     title = payload.get("title", "")
     description = payload.get("description", "")
+    mode = payload.get("mode") or "flow"
+    if mode not in ("flow", "single"):
+        mode = "flow"
     if not title.strip() and description.strip():
         title = description.strip()[:20]
     epic_id = payload.get("epic_id")
@@ -173,6 +178,7 @@ async def create_task(payload: dict):
         epic_id=epic_id,
         assignee=assignee,
         workspace_dir=workspace_dir,
+        mode=mode,
     )
     try:
         os.makedirs(workspace_dir or os.path.join(PROJECT_ROOT, task_id),
@@ -180,12 +186,21 @@ async def create_task(payload: dict):
     except OSError:
         logger.exception(f"create_task: 创建任务根失败 task_id={task_id}")
 
-    try:
-        orch = _get_orchestrator()
-        await orch._ensure_initial_orchestration(task_id)
-        await orch.start_task(task_id)
-    except Exception:
-        pass
+    if mode == "single":
+        await _get_storage().ensure_step(task_id, "chat", "对话", "executor")
+        if description.strip():
+            try:
+                await sm.handle_step_intervention(task_id, "chat", "send", description)
+                await _get_orchestrator().start_task(task_id)
+            except Exception:
+                logger.exception(f"create_task: single 首句启动失败 task_id={task_id}")
+    else:
+        try:
+            orch = _get_orchestrator()
+            await orch._ensure_initial_orchestration(task_id)
+            await orch.start_task(task_id)
+        except Exception:
+            pass
 
     try:
         asyncio.create_task(_auto_generate_title(task_id, description))
@@ -197,6 +212,7 @@ async def create_task(payload: dict):
         "task_type": task_type,
         "title": title,
         "steps": [],
+        "mode": mode,
     }
 
 
@@ -287,6 +303,24 @@ async def _get_decision_pkg(storage, task_id: str, step_id: str) -> Optional[dic
     return obj
 
 
+async def _get_pending_question(storage, task_id: str, step_id: str) -> Optional[dict]:
+    try:
+        raw = await storage.get_artifact(task_id, step_id, "question")
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw or not raw.get("content"):
+        return None
+    try:
+        obj = json.loads(raw["content"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("question"), str):
+        return None
+    if not obj["question"].strip():
+        return None
+    return obj
+
+
 async def _step_has_decision_pkg(storage, task_id: str, step_id: str) -> bool:
     if await _get_decision_pkg(storage, task_id, step_id):
         return True
@@ -370,6 +404,87 @@ async def delete_task(task_id: str):
     return {"status": "deleted", "task_id": task_id}
 
 
+@rest_app.post("/api/task/{task_id}/switch-to-flow")
+async def switch_to_flow(task_id: str):
+    orch = _get_orchestrator()
+    storage = _get_storage()
+
+    task = await storage.get_task(task_id, include_hidden=True)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+    if task.get("mode") != "single":
+        raise _state_error(ValueError("仅单步骤对话任务可切换为多步骤流程"))
+
+    if orch.is_running(task_id):
+        await orch.abort(task_id)
+        await orch.wait_stopped(task_id)
+
+    msgs = await storage.get_step_messages(task_id, "chat")
+    parts: list[str] = [
+        f"以下是本任务此前的单步骤对话完整记录（用户与 AI 的一来一往，"
+        f"共 {len(msgs)} 条）。请基于对话内容理解用户目标，编排后续流程。"
+        "此前产生的文件产物在任务工作目录与 .dc_tmp/<tid>/chat/artifacts/ 下，"
+        "路径仍有效，可直接用 dcflow_read_file 读取。",
+        "",
+    ]
+    for m in msgs or []:
+        role = m.get("role", "")
+        content = str(m.get("content") or "").strip()
+        if role == "user":
+            if content:
+                parts.append(f"[用户]\n{content}")
+        elif role == "assistant":
+            if m.get("tool_calls"):
+                name = m.get("tool_name") or ""
+                desc = ""
+                try:
+                    _tc = json.loads(m.get("tool_calls") or "[]")
+                    if _tc:
+                        _fn = (_tc[0].get("function") or {})
+                        name = _fn.get("name") or name
+                        _args = json.loads(_fn.get("arguments") or "{}")
+                        desc = str(_args.get("description") or _args.get("file_path")
+                                   or _args.get("pattern") or "")[:200]
+                except (ValueError, TypeError):
+                    pass
+                out = str(m.get("tool_output") or "")[:500]
+                parts.append(f"[AI 工具] {name} {desc}\n输出: {out}")
+            elif content:
+                parts.append(f"[AI]\n{content}")
+    try:
+        raw_iv = await storage.get_artifact(task_id, "chat", "intervention")
+        if raw_iv and raw_iv.get("content"):
+            ivs = json.loads(raw_iv["content"])
+            iv_list = ivs if isinstance(ivs, list) else [ivs]
+            for iv in iv_list:
+                if isinstance(iv, dict) and iv.get("message"):
+                    parts.append(f"[用户（发送中未送达）]\n{iv['message']}")
+    except (ValueError, TypeError):
+        pass
+    transcript = "\n\n".join(p for p in parts if p.strip())
+    await storage.save_artifact(task_id, "_flow", "chat_history",
+                                transcript, "text")
+
+    await storage.update_task(task_id, {"mode": "flow"})
+
+    await storage.remove_steps(task_id, ["chat"])
+    conn = await storage._get_conn()
+    conn.execute("DELETE FROM stream_chunks WHERE task_id = ? AND step_id = 'chat'",
+                 (task_id,))
+    conn.commit()
+    orch._prep_cache.pop(f"{task_id}:chat", None)
+
+    await orch._ensure_initial_orchestration(task_id)
+    await orch.start_task(task_id)
+
+    try:
+        await orch._publish_task_updated(task_id)
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info(f"[DC:REST] task {task_id} switched single → flow (in-place, same tid)")
+    return {"status": "ok", "task_id": task_id}
+
+
 @rest_app.post("/api/task/{task_id}/pause")
 async def pause_task(task_id: str, payload: dict = None):
     if payload:
@@ -384,7 +499,8 @@ async def pause_task(task_id: str, payload: dict = None):
         if task:
             for s in task.get("steps", []):
                 if s.get("status") == "active":
-                    await sm.advance_step(task_id, s["step_id"], "pending")
+                    await sm.advance_step(task_id, s["step_id"], "pending",
+                                          tolerant=True)
     except ValueError as e:
         raise _state_error(e)
     return {"status": "ok", "task_id": task_id}
@@ -439,7 +555,9 @@ async def get_code_diagram(task_id: str):
 
 def _validate_completion(completion: Any) -> str:
     if not isinstance(completion, dict):
-        return "completion 必须是对象"
+        return ("completion 必须是对象，正确写法："
+                'completion = {"done": ["已完成项→落地位置"], '
+                '"verified": ["验证命令→实际结果"]}（done/verified 至少一项）')
 
     def _items(v: Any) -> list:
         return v if isinstance(v, list) else []
@@ -450,12 +568,17 @@ def _validate_completion(completion: Any) -> str:
     blocked = completion.get("blocked") if isinstance(completion.get("blocked"), dict) else {}
     if not done and not verified and not unfinished and not blocked:
         return ("完成声明必须结构化：done/verified 至少一项，"
-                "或显式声明 unfinished/blocked")
+                "或显式声明 unfinished/blocked。正确写法："
+                'completion = {"done": ["已完成项→落地位置"], '
+                '"verified": ["验证命令→实际结果摘要"]}')
     if unfinished:
         preview = "、".join(str(x) for x in unfinished[:3])
         return (f"存在未完成项（{preview}），不得以半途状态结束——"
-                "继续完成这些项；确属受阻走 blocked 申报"
-                "（须附 tried 失败证据且 variants_left 为空）")
+                "unfinished 只写**本步骤职责范围内**、尚未完成的事项，这些必须继续完成；"
+                "不属于本步骤的后续工作/其他角色事项（由后续步骤、编排者或人工承接）"
+                "请从 unfinished 移除并写进 summary 的建议；本步已尝试但未达成、已登记为"
+                "受限/风险的结论写进 done（含登记位置与替代判据），不要留在 unfinished；"
+                "确属受阻走 blocked 申报（须附 tried 失败证据且 variants_left 为空）")
     vl = _items(blocked.get("variants_left"))
     if vl:
         preview = "、".join(str(x) for x in vl[:3])
@@ -571,6 +694,8 @@ async def get_step_detail(step_id: str, task_id: str, limit: int = 200, before_s
     latest = await storage.get_step_messages(task_id, step_id, limit=1)
     max_seq = latest[0]["seq"] if latest else -1
     messages = await storage.get_step_messages(task_id, step_id, limit=limit, before_seq=before_seq)
+    for _m in messages:
+        _m.pop("reasoning", None)
     truncated = bool(messages and messages[0]["seq"] > 0)
     return {
         "stepId": step_id,
@@ -584,6 +709,7 @@ async def get_step_detail(step_id: str, task_id: str, limit: int = 200, before_s
         "step": step,
         "live": orch.get_step_live(task_id, step_id),
         "decision": await _get_decision_pkg(storage, task_id, step_id),
+        "pendingQuestion": await _get_pending_question(storage, task_id, step_id),
     }
 
 
@@ -642,6 +768,14 @@ async def submit_step_result(payload: dict):
     step = next((s for s in task.get("steps", []) if s["step_id"] == step_id), None) if task else None
     if step and step.get("status") != "completed":
         await sm.advance_step(task_id, step_id, "completed")
+        if step.get("type") not in ("monitor", "review", "report") \
+                and not step_id.startswith("monitor-"):
+            try:
+                await storage.export_step_conversation(
+                    task_id, step_id, get_step_temp_dir(task_id, step_id))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[DC:REST] export step conversation failed "
+                               f"task={task_id} step={step_id}: {e}")
 
 
     return {"status": "step_completed", "task_id": task_id, "step_id": step_id}
@@ -673,7 +807,13 @@ async def append_step_message(payload: dict):
 async def get_step_messages(step_id: str, task_id: str, after_seq: int = -1,
                             limit: int = -1, before_seq: int = -1):
     storage = _get_storage()
-    if limit > 0:
+    if limit > 0 and after_seq >= 0:
+        messages = await storage.get_step_messages(
+            task_id, step_id, after_seq, limit=limit)
+        max_seq = messages[-1]["seq"] if messages else after_seq
+        total = None
+        truncated = None
+    elif limit > 0:
         latest = await storage.get_step_messages(task_id, step_id, limit=1)
         max_seq = latest[0]["seq"] if latest else -1
         messages = await storage.get_step_messages(
@@ -685,6 +825,8 @@ async def get_step_messages(step_id: str, task_id: str, after_seq: int = -1,
         max_seq = messages[-1]["seq"] if messages else (after_seq if after_seq >= 0 else -1)
         total = None
         truncated = None
+    for _m in messages:
+        _m.pop("reasoning", None)
     return {
         "task_id": task_id,
         "step_id": step_id,
@@ -807,6 +949,248 @@ def _kill_self_block_message(self_pid: int) -> str:
         f"（不要使用 /IM python），或在脚本中先按命令行过滤（排除含 dc_server.server 的进程）"
         f"再杀。"
     )
+
+
+
+_RC_TARGET_LIT_RE = re.compile(r"""(['"])([^'"\n]{0,300}?\.(?:log|txt))\1""",
+                               re.IGNORECASE)
+_RC_WRITE_RE = re.compile(
+    r"open\s*\((?:[^()]|\([^()]*\))*['\"][waxb+]{1,3}['\"]|\.write\s*\(|"
+    r"write_text\s*\(|write_bytes\s*\(|writelines\s*\(|os\.replace\s*\(|"
+    r"os\.rename\s*\(|shutil\.(?:copyfile|copy|copy2|move)\s*\(|"
+    r"logging\.FileHandler\s*\(|basicConfig\s*\([^)]*filename\s*=")
+_RC_REDIRECT_RE = re.compile(
+    r"""(?<![-<=])>>?(?![=&])\s*['"]?(?P<t>[^\s'"|&;]{1,300})""")
+_RC_TEE_RE = re.compile(r"\|\s*tee\s+(?:-a\s+)?['\"]?(?P<t>[^\s'\"|&;]{1,300})")
+_RC_LOG_TXT_END_RE = re.compile(r"\.(?:log|txt)$", re.IGNORECASE)
+_RC_ASSIGN_LIT_RE = re.compile(
+    r"""^\s*([A-Za-z_]\w*)\s*=\s*([rRbBuUfF]*)['"]([^'"\n]{1,300})['"]\s*(?:#.*)?$""")
+_RC_ASSIGN_JOIN_RE = re.compile(
+    r"^\s*([A-Za-z_]\w*)\s*=\s*os\.path\.join\s*\(([^)]*)\)\s*(?:#.*)?$")
+_PLAIN_STR_RE = re.compile(r"""^[rRbBuUfF]*['"]([^'"\n]{0,300})['"]$""")
+_RC_ID_WRITE_RES = (
+    re.compile(r"open\s*\(\s*([A-Za-z_]\w*)\s*,[^)]*?['\"][waxb+]{1,3}['\"]"),
+    re.compile(r"([A-Za-z_]\w*)\.write_(?:text|bytes)\s*\("),
+    re.compile(r"(?:os\.(?:replace|rename)|shutil\.(?:copyfile|copy|copy2|move))"
+               r"\s*\([^()]*,\s*([A-Za-z_]\w*)\s*[,)]"),
+    re.compile(r"logging\.FileHandler\s*\(\s*([A-Za-z_]\w*)"),
+    re.compile(r"basicConfig\s*\([^()]*filename\s*=\s*([A-Za-z_]\w*)"),
+)
+
+
+def _rc_subst_fstring(body: str, consts: dict) -> Optional[str]:
+    def _rep(m: "re.Match") -> str:
+        v = consts.get(m.group(1))
+        return v if v is not None else m.group(0)
+
+    out = re.sub(r"\{(\w+)(?::[^{}]*)?\}", _rep, body)
+    if "{" in out or "}" in out:
+        return None
+    return out
+
+
+def _rc_split_args(text: str) -> list:
+    args: list = []
+    cur: list = []
+    depth, q = 0, ""
+    for ch in text:
+        if q:
+            cur.append(ch)
+            if ch == q:
+                q = ""
+        elif ch in "'\"":
+            q = ch
+            cur.append(ch)
+        elif ch in "([{":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        args.append("".join(cur).strip())
+    return [a for a in args if a]
+
+
+def _rc_resolve_arg(arg: str, consts: dict) -> Optional[str]:
+    m = _PLAIN_STR_RE.match(arg)
+    if m:
+        body = m.group(1)
+        return _rc_subst_fstring(body, consts) if "{" in body else body
+    if re.fullmatch(r"[A-Za-z_]\w*", arg):
+        return consts.get(arg)
+    return None
+
+
+def _rc_paren_span(line: str, open_idx: int) -> Optional[tuple]:
+    depth, q = 0, ""
+    for k in range(open_idx, len(line)):
+        ch = line[k]
+        if q:
+            if ch == q:
+                q = ""
+            continue
+        if ch in "'\"":
+            q = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return line[open_idx + 1:k], k
+    return None
+
+
+def _rc_enclosing_join(line: str, lit_start: int) -> Optional[int]:
+    pos = line.rfind("os.path.join", 0, lit_start)
+    if pos < 0:
+        return None
+    open_idx = line.find("(", pos + len("os.path.join"))
+    if open_idx < 0 or open_idx >= lit_start:
+        return None
+    span = _rc_paren_span(line, open_idx)
+    if span is None or span[1] < lit_start:
+        return None
+    return open_idx
+
+
+def _rc_const_map(code: str) -> dict:
+    consts: dict = {}
+    lines = code.splitlines()
+    for _ in range(2):
+        for ln in lines:
+            m = _RC_ASSIGN_LIT_RE.match(ln)
+            if m:
+                body = m.group(3)
+                if "{" in body:
+                    body = _rc_subst_fstring(body, consts)
+                    if body is None:
+                        continue
+                consts[m.group(1)] = body
+                continue
+            m = _RC_ASSIGN_JOIN_RE.match(ln)
+            if m:
+                got: list = []
+                for a in _rc_split_args(m.group(2)):
+                    v = _rc_resolve_arg(a, consts)
+                    if v is None:
+                        break
+                    got.append(v)
+                if got:
+                    consts[m.group(1)] = os.path.join(*got)
+    return consts
+
+
+def _rc_lit_sites(lines: list, i: int, consts: dict) -> list:
+    out: list = []
+    ln = lines[i]
+    for m in _RC_TARGET_LIT_RE.finditer(ln):
+        jpos = _rc_enclosing_join(ln, m.start())
+        if jpos is not None:
+            span = _rc_paren_span(ln, jpos)
+            if span is None:
+                continue
+            got: list = []
+            for a in _rc_split_args(span[0]):
+                v = _rc_resolve_arg(a, consts)
+                if v is None:
+                    break
+                got.append(v)
+            if got:
+                out.append((m.group(0)[:120], os.path.join(*got)))
+            continue
+        body = m.group(2)
+        if "{" in body:
+            body = _rc_subst_fstring(body, consts)
+            if body is None:
+                continue
+        out.append((m.group(0)[:120], body))
+    return out
+
+
+def _rc_ident_sites(code: str, consts: dict) -> list:
+    out: list = []
+    for ln in code.splitlines():
+        for pat in _RC_ID_WRITE_RES:
+            for m in pat.finditer(ln):
+                v = consts.get(m.group(1))
+                if v and _RC_LOG_TXT_END_RE.search(v):
+                    out.append((m.group(0)[:120], v))
+    return out
+
+
+def _rc_redirect_sites(code: str, consts: dict) -> list:
+    out: list = []
+    for ln in code.splitlines():
+        for pat in (_RC_REDIRECT_RE, _RC_TEE_RE):
+            for m in pat.finditer(ln):
+                t = m.group("t").strip().strip("'\"")
+                if not t:
+                    continue
+                if "{" in t:
+                    t = _rc_subst_fstring(t, consts)
+                    if t is None:
+                        continue
+                if _RC_LOG_TXT_END_RE.search(t):
+                    out.append((m.group(0)[:120], t))
+    return out
+
+
+def _rc_line_has_marker(lines: list, i: int) -> bool:
+    for k in (i - 1, i, i + 1):
+        if 0 <= k < len(lines) and _RC_WRITE_RE.search(lines[k]):
+            return True
+    return False
+
+
+def _rc_log_txt_write_sites(code: str, consts: dict) -> list:
+    sites: list = []
+    lines = code.splitlines()
+    for i, ln in enumerate(lines):
+        if ln and _rc_line_has_marker(lines, i):
+            sites.extend(_rc_lit_sites(lines, i, consts))
+    sites.extend(_rc_ident_sites(code, consts))
+    sites.extend(_rc_redirect_sites(code, consts))
+    return sites
+
+
+def _rc_logtxt_block_message(snippet: str, step_dir: str) -> str:
+    if not step_dir:
+        return (f"[Blocked] run_code 未执行：本次调用没有 task_id/step_id 归属，"
+                f"不存在「自己的步骤文件夹」——任何 .log/.txt 写入一律拒绝"
+                f"（命中：{snippet}）。请在带任务/步骤归属的执行链里调用。")
+    return (f"[Blocked] run_code 未执行：代码会写本次步骤目录之外的 .log/.txt"
+            f"（命中：{snippet}）。\n"
+            f"规则：run_code 生成的 .log/.txt 只能写在本次步骤目录内 —— "
+            f"{step_dir}{os.sep}（例如 {step_dir}{os.sep}artifacts{os.sep}build.log）；"
+            f"项目树 / 任务工作目录 / 其他步骤目录 / 任务目录根 一律拒绝。\n"
+            f"请把写入路径（含 shell 重定向 > / >> 的目标）改成上述目录下的"
+            f"绝对路径后重发。")
+
+
+def _run_code_logtxt_violation(code: str, owner: tuple, root: str) -> str:
+    consts = _rc_const_map(code)
+    sites = _rc_log_txt_write_sites(code, consts)
+    if not sites:
+        return ""
+    tid, sid = owner
+    step_dir = (os.path.normpath(os.path.join(PROJECT_ROOT, ".dc_tmp",
+                                              str(tid), str(sid)))
+                if (tid and sid) else "")
+    if not step_dir:
+        return _rc_logtxt_block_message(sites[0][0], "")
+    step_key = os.path.normcase(step_dir)
+    for snippet, prefix in sites:
+        p = os.path.normcase(os.path.normpath(os.path.join(root, prefix)))
+        if p == step_key or p.startswith(step_key + os.sep):
+            continue
+        return _rc_logtxt_block_message(snippet, step_dir)
+    return ""
 
 
 def _proc_alive(pid: int) -> bool:
@@ -943,21 +1327,17 @@ def _timeout_result(timeout: int, out_buf: list, err_buf: list, clean: bool) -> 
     return f"[Error] timeout after {timeout}s{note}\n已捕获输出尾部:\n{tail}"
 
 
-def _persist_run_code(owner: tuple, code: str) -> str:
-    tid, sid = owner
-    if tid and sid:
-        d = os.path.join(PROJECT_ROOT, ".dc_tmp", tid, sid, "_code")
-    else:
-        d = os.path.join(PROJECT_ROOT, ".dc_tmp", "_code")
-    os.makedirs(d, exist_ok=True)
-    n = len([f for f in os.listdir(d) if f.endswith(".py")]) + 1
-    fp = os.path.join(d, f"r{n}.py")
-    while os.path.exists(fp):
-        n += 1
-        fp = os.path.join(d, f"r{n}.py")
-    with open(fp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(code if code.endswith("\n") else code + "\n")
-    return fp
+def _feed_stdin(stream, data: bytes) -> None:
+    try:
+        stream.write(data)
+        stream.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 _SEARCH_SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".venv",
@@ -980,10 +1360,10 @@ def _impl_list_dir(root: str, args: dict) -> dict:
 
 def _impl_read_file(root: str, args: dict) -> dict:
     fp = args["file_path"]
-    _rules_dir = rules_dir()
     _abs_fp = os.path.realpath(fp if os.path.isabs(fp) else os.path.join(root, fp))
-    if os.path.normcase(_abs_fp).startswith(
-            os.path.normcase(os.path.realpath(_rules_dir) + os.sep)):
+    _norm_abs = os.path.normcase(_abs_fp)
+    if any(_norm_abs.startswith(os.path.normcase(os.path.realpath(_d) + os.sep))
+           for _d in (rules_dir(), templates_dir())):
         full = _abs_fp
     else:
         try:
@@ -1046,6 +1426,34 @@ def _impl_write_file(root: str, args: dict) -> dict:
     return {"result": f"✓ 已写入 {fp} ({len(args['content'].encode('utf-8'))} bytes)"}
 
 
+def apply_edit_text(text: str, old: str, new: str,
+                    replace_all: bool, occurrence) -> tuple:
+    if not old:
+        return None, "[Error] old_string 不能为空（edit 需要精确匹配旧文本）"
+    count = text.count(old)
+    if count == 0:
+        return None, f"(未找到匹配文本: {old[:80]}...)"
+    if new == old:
+        return None, "(new_string 与 old_string 相同，未做任何修改)"
+    if replace_all:
+        return text.replace(old, new), ""
+    occ = occurrence
+    if occ is None:
+        occ = 1
+        hint = (f"（该文本共 {count} 处，已替换第 1 处；"
+                f"如需其他位置请传 occurrence）" if count > 1 else "")
+    else:
+        try:
+            occ = int(occ)
+        except (TypeError, ValueError):
+            return None, f"[Error] occurrence 必须是正整数: {occurrence!r}"
+        if occ < 1 or occ > count:
+            return None, f"(第 {occ} 处匹配不存在：共 {count} 处，occurrence 范围 1-{count})"
+        hint = ""
+    parts = text.split(old)
+    return old.join(parts[:occ]) + new + old.join(parts[occ:]), hint
+
+
 def _impl_edit_file(root: str, args: dict) -> dict:
     fp = args["file_path"]
     try:
@@ -1056,43 +1464,21 @@ def _impl_edit_file(root: str, args: dict) -> dict:
         return {"result": f"(文件不存在: {fp})"}
     old = args.get("old_string") or ""
     new = args.get("new_string") or ""
-    if not old:
-        return {"result": "[Error] old_string 不能为空（edit 需要精确匹配旧文本）"}
     with open(full, "r", encoding="utf-8") as f:
         text = f.read()
-    count = text.count(old)
-    if count == 0:
-        return {"result": f"(未找到匹配文本: {old[:80]}...)"}
-    if new == old:
-        return {"result": "(new_string 与 old_string 相同，未做任何修改)"}
-    replace_all = bool(args.get("replace_all"))
-    occ = args.get("occurrence")
-    if replace_all:
-        replaced, done = text.replace(old, new), count
-    else:
-        if occ is None:
-            occ = 1
-            hint = (f"（该文本共 {count} 处，已替换第 1 处；"
-                    f"如需其他位置请传 occurrence）" if count > 1 else "")
-        else:
-            try:
-                occ = int(occ)
-            except (TypeError, ValueError):
-                return {"result": f"[Error] occurrence 必须是正整数: {occ!r}"}
-            if occ < 1 or occ > count:
-                return {"result": f"(第 {occ} 处匹配不存在：共 {count} 处，occurrence 范围 1-{count})"}
-            hint = ""
-        parts = text.split(old)
-        replaced = old.join(parts[:occ]) + new + old.join(parts[occ:])
-        done = 1
+    replaced, note = apply_edit_text(text, old, new,
+                                     bool(args.get("replace_all")), args.get("occurrence"))
+    if replaced is None:
+        return {"result": note}
     with open(full, "w", encoding="utf-8") as f:
         f.write(replaced)
     with open(full, "r", encoding="utf-8") as f:
         if new not in f.read():
             return {"result": "[Error] 写入后回读未发现新内容，请重试"}
-    if replace_all:
-        return {"result": f"✓ 已替换 {done} 处 ({fp})"}
-    return {"result": f"✓ 已替换第 {occ} 处 ({fp}){hint}"}
+    if args.get("replace_all"):
+        return {"result": f"✓ 已替换 {text.count(old)} 处 ({fp})"}
+    occ = args.get("occurrence")
+    return {"result": f"✓ 已替换第 {1 if occ is None else int(occ)} 处 ({fp}){note}"}
 
 
 def _impl_read_doc(root: str, args: dict) -> dict:
@@ -1222,15 +1608,22 @@ async def invoke_tool(payload: dict):
                 return {"result": "[Error] code 不能为空（传完整 Python 代码，顶层直接执行）"}
             if _is_kill_self_cmd(code, os.getpid()):
                 return {"result": _kill_self_block_message(os.getpid())}
-            script = _persist_run_code(_resolve_owner(payload, args), code)
+            _logtxt_block = _run_code_logtxt_violation(
+                code, _resolve_owner(payload, args), root)
+            if _logtxt_block:
+                return {"result": _logtxt_block}
             env = dict(os.environ)
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"]
                                         if env.get("PYTHONPATH") else "")
-            p = subprocess.Popen([sys.executable, "-X", "utf8", script],
-                                 cwd=root, env=env, stdin=subprocess.DEVNULL,
+            p = subprocess.Popen([sys.executable, "-X", "utf8", "-"],
+                                 cwd=root, env=env, stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _code_bytes = (code if code.endswith("\n") else code + "\n").encode("utf-8")
+            t0 = threading.Thread(target=_feed_stdin, args=(p.stdin, _code_bytes),
+                                  daemon=True)
+            t0.start()
             graceful.add_cmd()
             _TASK_CMD_PIDS.setdefault(task_id, set()).add(p.pid)
             out_buf, err_buf = [], []
@@ -1267,6 +1660,7 @@ async def invoke_tool(payload: dict):
                 _TASK_CMD_PIDS.get(task_id, set()).discard(p.pid)
             t1.join(2)
             t2.join(2)
+            t0.join(2)
             out = _decode_bytes_auto(b"".join(out_buf))
             err = _decode_bytes_auto(b"".join(err_buf))
             prefix = "" if p.returncode == 0 else f"[exit {p.returncode}] "
@@ -1283,6 +1677,7 @@ async def invoke_tool(payload: dict):
             if not question:
                 return {"result": "[Error] question 不能为空（写清要确认什么与为什么需要确认）"}
             _ask_caller = "executor"
+            _at = None
             try:
                 _at = await storage.get_task(tid, include_hidden=True)
                 _as_ = next((s for s in (_at or {}).get("steps", [])
@@ -1291,9 +1686,11 @@ async def invoke_tool(payload: dict):
                     _ask_caller = _as_.get("type") or "executor"
             except Exception:  # noqa: BLE001
                 pass
-            if _ask_caller != "requirement":
+            _ask_single_ok = bool(_at and _at.get("mode") == "single" and sid == "chat")
+            if _ask_caller not in ("requirement", "plan") and not _ask_single_ok:
                 logger.warning(f"[DC:REST] ask_user 越权拒绝 step={sid} type={_ask_caller}")
-                return {"result": "[Error] dcflow_ask_user 仅需求分析师（type=requirement）可用"}
+                return {"result": "[Error] dcflow_ask_user 仅需求分析师（type=requirement）"
+                                  "与计划制定者（type=plan）可用"}
             options = [str(x).strip() for x in (args.get("options") or [])
                        if str(x).strip()][:6]
             ask_payload = {"question": question, "options": options}
@@ -1360,8 +1757,38 @@ async def invoke_tool(payload: dict):
                     await storage.save_artifact(tid, target, "review_residual",
                                                 json.dumps(_residual, ensure_ascii=False),
                                                 "json")
+            elif _caller_type == "plan_review":
+                _pr_keys = ("plan_issues", "plan_suggestions")
+                _pr_missing = [k for k in _pr_keys if not isinstance(args.get(k), list)]
+                if _pr_missing:
+                    return {"result": (
+                        "[Error] 方案审查 step_done 必须携带 plan_issues/plan_suggestions"
+                        f" 数组（缺失: {', '.join(_pr_missing)}；无内容传空数组 []）")}
+                _pr_issues = [str(x) for x in args["plan_issues"]]
+                if _pr_issues:
+                    return {"result": await _get_orchestrator().rewind_plan_review(
+                        task_id=tid, step_id=target,
+                        reason=str(args.get("summary") or "方案审查未通过"),
+                        summary=str(args.get("summary") or ""),
+                        issues=_pr_issues,
+                        suggestions=[str(x) for x in args["plan_suggestions"]])}
+            completion = args.get("completion")
+            if completion is not None and _caller_type == "executor":
+                err = _validate_completion(completion)
+                if err:
+                    return {"result": f"[Error] {err}"}
+            score = args.get("score")
+            if _caller_type == "requirement":
+                if score is None:
+                    return {"result": (
+                        "[Error] 需求分析师 step_done 必须携带 score 参数"
+                        "（functionPoints/fileCount/isMultiModule/isArchitectural/"
+                        "clarity/difficulty 六个字段，只填数字与布尔值，不写解释）")}
+                _score_err = validate_score_params(score)
+                if _score_err:
+                    return {"result": f"[Error] {_score_err}"}
             if ((_s_caller or {}).get("human_attention") == "gate"
-                    and _caller_type != "plan"):
+                    and _caller_type not in ("plan", "plan_review")):
                 approval = args.get("approval")
                 _ap_err = _validate_approval(approval)
                 if not _ap_err and str(approval.get("doc_path") or "").strip():
@@ -1407,25 +1834,11 @@ async def invoke_tool(payload: dict):
             if args.get("summary"):
                 await storage.save_artifact(tid, target,
                                             "summary", args["summary"], "text")
-            completion = args.get("completion")
             if completion is not None:
-                if _caller_type == "executor":
-                    err = _validate_completion(completion)
-                    if err:
-                        return {"result": f"[Error] {err}"}
                 await storage.save_artifact(tid, target, "completion",
                                             json.dumps(completion, ensure_ascii=False),
                                             "json")
-            score = args.get("score")
             if _caller_type == "requirement":
-                if score is None:
-                    return {"result": (
-                        "[Error] 需求分析师 step_done 必须携带 score 参数"
-                        "（functionPoints/fileCount/isMultiModule/isArchitectural/"
-                        "clarity/difficulty 六个字段，只填数字与布尔值，不写解释）")}
-                _score_err = validate_score_params(score)
-                if _score_err:
-                    return {"result": f"[Error] {_score_err}"}
                 _prev = await storage.get_artifact(tid, "_flow", "task_score")
                 _delta = 0.0
                 if _prev and _prev.get("content"):
@@ -1596,39 +2009,29 @@ async def invoke_tool(payload: dict):
                     if isinstance(s, dict):
                         s["model_tier"] = _STEP_TYPE_MODEL_TIER.get(
                             s.get("type") or "executor", "light")
-                anchored_steps = [s for s in new_steps
-                                  if isinstance(s, dict) and s.get("after_step_id")]
-                plain_steps = [s for s in new_steps
-                               if not (isinstance(s, dict) and s.get("after_step_id"))]
                 insert_parts: list[str] = []
-                if anchored_steps:
-                    for s in anchored_steps:
-                        anchor_id = s.pop("after_step_id")
-                        if is_hidden_step({"step_id": anchor_id}):
-                            return {"result": ("[Error] after_step_id 不能是审查/收尾"
-                                                "步骤（monitor/review/report）")}
-                        await storage.add_steps(tid, [s], anchor_id)
-                        insert_parts.append(f"{s.get('step_id')} → {anchor_id} 之后")
-                if plain_steps:
-                    if top_after and is_hidden_step({"step_id": top_after}):
-                        return {"result": ("[Error] after_step_id 不能是审查/收尾"
-                                            "步骤（monitor/review/report）")}
-                    if not top_after:
+                prev_inserted = None
+                for s in new_steps:
+                    if not isinstance(s, dict):
+                        continue
+                    anchor_id = s.pop("after_step_id", None) or prev_inserted or top_after
+                    if not anchor_id:
                         task_now = await storage.get_task(tid, include_hidden=True)
                         if task_now:
-                            anchor = None
-                            for s in sorted(task_now.get("steps", []),
-                                            key=lambda x: x.get("sort_order", 0)):
-                                if s.get("step_id") in ("review", "report"):
+                            for s2 in sorted(task_now.get("steps", []),
+                                             key=lambda x: x.get("sort_order", 0)):
+                                if s2.get("step_id") in ("review", "report"):
                                     break
-                                if not is_hidden_step(s):
-                                    anchor = s.get("step_id")
-                            if anchor:
-                                top_after = anchor
-                    await storage.add_steps(tid, plain_steps, top_after)
-                    plain_ids = ",".join(str(s.get("step_id")) for s in plain_steps)
-                    insert_parts.append(f"{plain_ids} → "
-                                        f"{top_after + ' 之后' if top_after else '末尾真实步骤之后'}")
+                                if not is_hidden_step(s2):
+                                    anchor_id = s2.get("step_id")
+                    if anchor_id and is_hidden_step({"step_id": anchor_id}):
+                        return {"result": ("[Error] after_step_id 不能是审查/收尾"
+                                           "步骤（monitor/review/report）")}
+                    await storage.add_steps(tid, [s], anchor_id)
+                    if s.get("step_id"):
+                        prev_inserted = str(s["step_id"])
+                    insert_parts.append(f"{s.get('step_id')} → "
+                                        f"{anchor_id + ' 之后' if anchor_id else '末尾真实步骤之后'}")
                 await storage.append_event(tid, {
                     "event_type": "orchestration", "actor": "ai",
                     "content": {"action": "add_steps", "steps": new_steps,
@@ -1754,44 +2157,31 @@ async def advance_step(payload: dict):
 async def compress_step(payload: dict):
     task_id = payload["task_id"]
     step_id = payload["step_id"]
+    return await _get_orchestrator().manual_compress_check(task_id, step_id)
+
+
+@rest_app.post("/api/step/answer")
+async def answer_step_question(payload: dict):
+    task_id = payload["task_id"]
+    step_id = payload["step_id"]
+    answer = str(payload.get("answer") or "").strip()
+    if not answer:
+        raise HTTPException(400, "answer 不能为空")
+
+    orch = _get_orchestrator()
     storage = _get_storage()
-    messages = await storage.get_step_messages(task_id, step_id)
-    if len(messages) <= 6:
-        return {"status": "skipped", "reason": "too_few_messages", "count": len(messages)}
 
-    early = messages[:-6]
-    recent = messages[-6:]
-    summary_seq = early[0]["seq"]
-    summary_lines = [f"[{m['role']}]: {str(m.get('content', ''))[:100]}..." for m in early]
-    summary_content = "[早期对话已压缩]\n" + "\n".join(summary_lines)
+    await storage.save_artifact(task_id, step_id, "question", "", "json")
 
-    conn_factory = getattr(storage, "_get_conn", None)
-    if conn_factory is not None:
-        conn = await conn_factory()
-        conn.execute(
-            "DELETE FROM step_messages WHERE task_id = ? AND step_id = ? AND seq < ?",
-            (task_id, step_id, recent[0]["seq"]),
-        )
-        conn.execute(
-            """INSERT INTO step_messages (task_id, step_id, seq, role, content, round_num, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (task_id, step_id, summary_seq, "system", summary_content, 0,
-             datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
-    else:
-        await storage.clear_step_messages(task_id, step_id)
-        await storage.append_message(
-            task_id, step_id,
-            {"role": "system", "content": summary_content, "round_num": 0},
-            seq=summary_seq,
-        )
-        for m in recent:
-            await storage.append_message(task_id, step_id, m, seq=m["seq"])
+    evt = orch._ask_user_answers.get(task_id)
+    if evt:
+        orch._ask_user_results[task_id] = answer
+        evt.set()
+        logger.info(f"[DC:REST] ask_user answered tid={task_id} step={step_id} "
+                    f"a={answer[:50]}")
+        return {"status": "ok"}
 
-    _get_orchestrator()._publish(
-        task_id, "messagesReset", {"stepId": step_id})
-    return {"status": "ok", "original_count": len(messages), "compressed_count": len(early)}
+    raise HTTPException(400, "当前步骤没有待回答的问题")
 
 
 @rest_app.post("/api/step/resume")
@@ -1820,6 +2210,8 @@ async def _publish_user_message(task_id: str, step_id: str, message: str,
                                 client_msg_id: Optional[str] = None) -> None:
     storage = _get_storage()
     orch = _get_orchestrator()
+    if not client_msg_id:
+        client_msg_id = f"um-{uuid4().hex}"
     announce = getattr(orch, "_announce_user_message", None)
     if announce is not None:
         mid_round = False
@@ -1830,7 +2222,7 @@ async def _publish_user_message(task_id: str, step_id: str, message: str,
             except Exception:  # noqa: BLE001
                 mid_round = False
         await announce(task_id, step_id, message, mid_round=mid_round,
-                       client_msg_id=client_msg_id)
+                       client_msg_id=client_msg_id, queued=True)
     else:
         await storage.append_message(task_id, step_id,
                                      {"role": "user", "content": message, "round_num": -1})
@@ -1847,6 +2239,7 @@ async def _publish_user_message(task_id: str, step_id: str, message: str,
                 if isinstance(iv, dict) and iv.get("message") == message \
                         and not iv.get("persisted"):
                     iv["persisted"] = True
+                    iv["client_msg_id"] = client_msg_id
                     break
             await storage.save_artifact(task_id, step_id, "intervention",
                                         json.dumps(data, ensure_ascii=False), "json")
@@ -1865,9 +2258,14 @@ async def intervene_step(payload: dict):
     sm = _get_state_machine()
     orch = _get_orchestrator()
     try:
+        _iv_task = await _get_storage().get_task(task_id, include_hidden=True)
+        _is_single = bool(_iv_task and _iv_task.get("mode") == "single")
         if intervention_type == "stop":
-            await sm.stop_step(task_id, step_id)
-            await orch.abort(task_id)
+            if _is_single:
+                await orch.abort(task_id)
+            else:
+                await sm.stop_step(task_id, step_id)
+                await orch.abort(task_id)
         elif intervention_type == "force_inject":
             _ftask = await _get_storage().get_task(task_id, include_hidden=True)
             _fstep = next((s for s in (_ftask or {}).get("steps", [])
@@ -1890,7 +2288,17 @@ async def intervene_step(payload: dict):
             step = None
             if task:
                 step = next((s for s in task.get("steps", []) if s.get("step_id") == step_id), None)
-            if step and is_hidden_step(step):
+            if _is_single:
+                cur_status = step.get("status") if step else None
+                if cur_status in ("completed", "skipped", "stopped"):
+                    if orch.is_running(task_id):
+                        await orch.abort(task_id)
+                        await orch.wait_stopped(task_id)
+                    await sm.reset_step_for_continuation(task_id, step_id, "用户消息续接")
+                await sm.handle_step_intervention(task_id, step_id, "send", message)
+                await _publish_user_message(task_id, step_id, message, client_msg_id)
+                await orch.start_task(task_id)
+            elif step and is_hidden_step(step):
                 cur_status = step.get("status")
                 if cur_status in ("completed", "skipped", "stopped"):
                     if orch.is_running(task_id):
@@ -1917,6 +2325,9 @@ async def intervene_step(payload: dict):
                 await _publish_user_message(task_id, step_id, message, client_msg_id)
                 await orch.start_task(task_id)
             elif step and step.get("status") == "stopped":
+                if orch.is_running(task_id):
+                    await orch.abort(task_id)
+                    await orch.wait_stopped(task_id)
                 await sm.resume_step(task_id, step_id, message)
                 await _publish_user_message(task_id, step_id, message, client_msg_id)
                 await orch.start_task(task_id)
@@ -1980,6 +2391,10 @@ async def intervene_flow(payload: dict):
     sm = _get_state_machine()
     orch = _get_orchestrator()
     storage = _get_storage()
+    _if_task = await storage.get_task(task_id)
+    if _if_task and _if_task.get("mode") == "single":
+        raise _state_error(ValueError(
+            "单步骤对话无流程编排，请先切换为多步骤流程（或直接在聊天中发消息）"))
     try:
         if mode == "rebuild":
             if not step_id:
@@ -2203,9 +2618,9 @@ async def monitor_export(payload: dict, storage: Any = None):
     if is_final:
         step_type = payload.get("step_type") or (
             "report" if step_id == "report" else "review")
-        monitor_prompt = load_prompt(prompt_for_step(step_id, step_type))
+        monitor_prompt = load_role_prompt(prompt_for_step(step_id, step_type))
     else:
-        monitor_prompt = load_prompt(prompt_for_step(step_id, "monitor"))
+        monitor_prompt = load_role_prompt(prompt_for_step(step_id, "monitor"))
 
 
     user_context = (
@@ -2265,6 +2680,11 @@ async def monitor_trigger(payload: dict):
     trigger_step_id = payload.get("trigger_step_id", "")
     reason = payload.get("reason", "")
 
+    _mt_task = await _get_storage().get_task(task_id)
+    if _mt_task and _mt_task.get("mode") == "single":
+        raise _state_error(ValueError(
+            "单步骤对话无流程编排，请先切换为多步骤流程（或直接在聊天中发消息）"))
+
     monitor = _get_monitor_context()
     context = await monitor._build_monitor_context(task_id, trigger_step_id)
 
@@ -2273,7 +2693,7 @@ async def monitor_trigger(payload: dict):
 
     conv_text = await _monitor_global_assets(monitor.storage, task_id, trigger_step_id, steps)
 
-    monitor_prompt = load_prompt(prompt_for_step(trigger_step_id, "monitor"))
+    monitor_prompt = load_role_prompt(prompt_for_step(trigger_step_id, "monitor"))
     user_context = (
         f"当前任务: {task.get('title', '')} (类型: {task.get('type', '')})\n\n"
         f"## 介入原因\n"
@@ -2656,6 +3076,32 @@ async def test_mcp(payload: dict):
 
 
 
+@rest_app.get("/api/stats/daily-tokens")
+async def stats_daily_tokens(days: str = "30"):
+    try:
+        n = int(days)
+    except (ValueError, TypeError):
+        n = 30
+    if n <= 0:
+        n = 30
+    n = max(1, min(n, 365))
+    rows = await _get_storage().get_daily_token_usage(n)
+    by_date = {str(r["date"]): r for r in rows if r.get("date")}
+    today = datetime.now().astimezone().date()
+    items = []
+    for i in range(n - 1, -1, -1):
+        d = (today - timedelta(days=i)).isoformat()
+        r = by_date.get(d)
+        prompt = int((r or {}).get("prompt") or 0)
+        cached = int((r or {}).get("cached") or 0)
+        completion = int((r or {}).get("completion") or 0)
+        items.append({"date": d, "prompt": prompt, "cached": cached,
+                      "completion": completion, "total": prompt + completion})
+    return {"days": n, "items": items}
+
+
+
+
 async def _recover_stale_tasks() -> int:
     storage = _get_storage()
     sm = _get_state_machine()
@@ -2689,6 +3135,8 @@ async def _auto_resume_tasks() -> int:
     for t in tasks:
         if t.get("status") != "active":
             continue
+        if t.get("mode") == "single":
+            continue
         steps = t.get("steps", [])
         if not steps:
             continue
@@ -2714,6 +3162,15 @@ async def _graceful_shutdown() -> None:
             logger.exception(f"[DC:shutdown] abort task {task_id} failed")
         task = await storage.get_task(task_id)
         if not task:
+            continue
+        if task.get("mode") == "single":
+            for s in task.get("steps", []):
+                if s.get("status") == "active":
+                    try:
+                        await sm.advance_step(task_id, s["step_id"], "pending")
+                    except ValueError:
+                        pass
+            logger.info(f"[DC:shutdown] single chat task {task_id} parked to pending")
             continue
         for s in task.get("steps", []):
             if s.get("status") == "active":

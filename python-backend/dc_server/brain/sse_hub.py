@@ -25,6 +25,9 @@ class SseHub:
         return event
 
 
+    def last_seq(self, task_id: str) -> int:
+        return self._seq.get(task_id, 0)
+
     def publish(self, task_id: str, command: str, payload: dict) -> int:
         event = self._make_event(task_id, command, payload)
         buf = self._buffer.setdefault(task_id, deque(maxlen=self._max_backlog))

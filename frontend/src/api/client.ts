@@ -2,6 +2,7 @@ import type {
   ConfigSave,
   ConfigView,
   CreateTaskResult,
+  DailyTokenUsage,
   FsBrowse,
   FsFile,
   FsTree,
@@ -14,6 +15,7 @@ import type {
   TaskDetail,
   TaskOverview,
 } from './types'
+import type {CompressResult} from '../utils/compressResult'
 
 export class ApiError extends Error {
   status: number
@@ -71,8 +73,12 @@ export const api = {
   listTasks(): Promise<TaskOverview> {
     return request<TaskOverview>('/api/tasks')
   },
-  createTask(description: string, extra?: { workspace_dir?: string }): Promise<CreateTaskResult> {
+  createTask(description: string, extra?: { workspace_dir?: string; mode?: 'flow' | 'single' }): Promise<CreateTaskResult> {
     return request<CreateTaskResult>('/api/task', json('POST', {description, ...(extra ?? {})}))
+  },
+  switchToFlow(taskId: string): Promise<{ status: string; task_id: string }> {
+    return request<{ status: string; task_id: string }>(
+        `/api/task/${encodeURIComponent(taskId)}/switch-to-flow`, json('POST'))
   },
   startTask(taskId: string): Promise<{ status: string }> {
     return request<{ status: string }>(`/api/task/${encodeURIComponent(taskId)}/start`, json('POST'))
@@ -146,10 +152,7 @@ export const api = {
   resumeStep(taskId: string, stepId: string): Promise<unknown> {
     return request<unknown>('/api/step/resume', json('POST', {task_id: taskId, step_id: stepId}))
   },
-  compressStep(taskId: string, stepId: string): Promise<{
-    status: string; reason?: string; count?: number;
-    original_count?: number; compressed_count?: number;
-  }> {
+  compressStep(taskId: string, stepId: string): Promise<CompressResult> {
     return request('/api/step/compress', json('POST', {task_id: taskId, step_id: stepId}))
   },
   getConfig(): Promise<ConfigView> {
@@ -160,6 +163,9 @@ export const api = {
   },
   testLlm(): Promise<{ ok: boolean; error?: string; model?: string }> {
     return request<{ ok: boolean; error?: string; model?: string }>('/api/config/test-llm', json('POST'))
+  },
+  getDailyTokens(days = 30): Promise<DailyTokenUsage> {
+    return request<DailyTokenUsage>(`/api/stats/daily-tokens?days=${days}`)
   },
   testMcp(server: McpServerConfig): Promise<McpTestResult> {
     return request<McpTestResult>('/api/config/test-mcp', json('POST', {server}))

@@ -1,4 +1,5 @@
 import {
+  type AskUserEvent,
   type GateApprovalReadyEvent,
   type LlmErrorEvent,
   type MessagesConfirmedEvent,
@@ -47,6 +48,7 @@ export interface StepStreamHandlers {
   onStepTokensUpdated?: (e: StepTokensUpdatedEvent) => void
   onStepStatsUpdated?: (e: StepStatsUpdatedEvent) => void
   onGateApprovalReady?: (e: GateApprovalReadyEvent) => void
+  onAskUser?: (e: AskUserEvent) => void
   onMessagesReset?: (e: MessagesResetEvent) => void
   onReconnect?: () => void
 }
@@ -65,6 +67,8 @@ export interface StepStream {
 }
 
 const RECONNECT_DELAY_MS = 3000
+export const WATCHDOG_CONFIG = {intervalMs: 10_000, timeoutMs: 45_000}
+const GLOBAL_COMMANDS = new Set(['llmError', 'taskUpdated', 'stepStatus'])
 
 export function createStepStream(
     taskId: string,
@@ -78,7 +82,23 @@ export function createStepStream(
   let retryVisible = false
   let hadOpen = false
   let lastOpts: ConnectOpts | undefined
+  let lastEventAt = Date.now()
+  let watchdogTimer: number | null = null
   const pendingEvents: SseEvent[] = []
+
+  function startWatchdog(): void {
+    if (watchdogTimer != null) return
+    watchdogTimer = window.setInterval(() => {
+      if (closed) return
+      if (Date.now() - lastEventAt <= WATCHDOG_CONFIG.timeoutMs) return
+      lastEventAt = Date.now()
+      if (es) {
+        es.close()
+        es = null
+      }
+      connect(undefined, lastOpts)
+    }, WATCHDOG_CONFIG.intervalMs)
+  }
 
   function stepMatches(stepId: string): boolean {
     if (matchStepId) return matchStepId(stepId)
@@ -139,6 +159,9 @@ export function createStepStream(
       case 'gateApprovalReady':
         handlers.onGateApprovalReady?.(ev as GateApprovalReadyEvent)
         break
+      case 'askUser':
+        handlers.onAskUser?.(ev as AskUserEvent)
+        break
       case 'messagesReset':
         handlers.onMessagesReset?.(ev as MessagesResetEvent)
         break
@@ -155,7 +178,12 @@ export function createStepStream(
   }
 
   function handleEvent(ev: SseEvent): void {
+    if (ev.command === 'heartbeat') {
+      lastEventAt = Date.now()
+      return
+    }
     lastSeqRef.set(taskId, ev.seq)
+    lastEventAt = Date.now()
 
     if (activeStepId == null) {
       pendingEvents.push(ev)
@@ -163,7 +191,7 @@ export function createStepStream(
     }
 
     const evStepId = (ev as { stepId?: string }).stepId
-    if (evStepId != null && ev.command !== 'llmError' && !stepMatches(evStepId)) return
+    if (evStepId != null && !GLOBAL_COMMANDS.has(ev.command) && !stepMatches(evStepId)) return
 
     process(ev)
   }
@@ -182,7 +210,9 @@ export function createStepStream(
     if (lms != null) parts.push(`lastMsgSeq=${lms}`)
     const url = `/sse?${parts.join('&')}`
     es = new EventSource(url)
+    startWatchdog()
     es.onopen = () => {
+      lastEventAt = Date.now()
       if (hadOpen) handlers.onReconnect?.()
       hadOpen = true
     }
@@ -214,6 +244,10 @@ export function createStepStream(
       window.clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
+    if (watchdogTimer != null) {
+      window.clearInterval(watchdogTimer)
+      watchdogTimer = null
+    }
     if (es) {
       es.close()
       es = null
@@ -226,7 +260,7 @@ export function createStepStream(
     const queued = pendingEvents.splice(0, pendingEvents.length)
     for (const ev of queued) {
       const evStepId = (ev as { stepId?: string }).stepId
-      if (evStepId != null && ev.command !== 'llmError' && !stepMatches(evStepId)) continue
+      if (evStepId != null && !GLOBAL_COMMANDS.has(ev.command) && !stepMatches(evStepId)) continue
       process(ev)
     }
   }

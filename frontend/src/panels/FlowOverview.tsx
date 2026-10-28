@@ -418,6 +418,10 @@ export default function FlowOverview({taskId}: FlowOverviewProps) {
     )
   }
 
+  if (task.mode === 'single') {
+    return <Navigate to={`/task/${taskId}/chat`} replace/>
+  }
+
   const steps = task.steps || []
   const sortedSteps = [...steps].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
   const firstPendingId = sortedSteps.find((s) => s.status === 'pending')?.step_id
@@ -642,7 +646,7 @@ export default function FlowOverview({taskId}: FlowOverviewProps) {
             <div className="flow-view">
               <div className="progress-wrap">
                 <ProgressRail
-                    steps={steps}
+                    steps={sortedSteps}
                     pausedPendingId={task.status === 'paused' ? firstPendingId : undefined}
                     onDotClick={(stepId) => navigate(`/task/${taskId}/step/${stepId}`)}
                 />
@@ -800,7 +804,7 @@ export default function FlowOverview({taskId}: FlowOverviewProps) {
                                   (task.status === 'paused' && (task.steps ?? []).some((s) => s.status === 'active'))}/>
                 <TokenDetails prompt={totals.prompt} cached={totals.cached} completion={totals.completion}
                               cost={totalCost}
-                              trailing={<TokenMetrics startedAt={null} endedAt={null} active={false} activeSince={null}
+                              trailing={<TokenMetrics startedAt={null} endedAt={null} active={false} baseAt={null}
                                                       runDurationMs={totals.runDurationMs} outputDurationMs={totals.outputDurationMs}
                                                       ttftMs={totalsTtftMs} requestCount={totals.requests}
                                                       completion={totals.completion}/>}/>

@@ -801,13 +801,13 @@ class ApiStubs:
         self.uc.reg_write(x86_const.UC_X86_REG_EAX, ENV.HEAP_BASE)
 
     def _tick(self, args):
-        self.session.clock += 16
-        self.uc.reg_write(x86_const.UC_X86_REG_EAX, self.session.clock & 0xFFFFFFFF)
+        clock_val = self.session.advance_clock(16)
+        self.uc.reg_write(x86_const.UC_X86_REG_EAX, clock_val & 0xFFFFFFFF)
 
     def _qpc(self, args):
-        self.session.clock += 16
+        clock_val = self.session.advance_clock(16)
         if args:
-            self.uc.mem_write(args[0], ctypes.c_uint64(self.session.clock).value.to_bytes(8, "little"))
+            self.uc.mem_write(args[0], ctypes.c_uint64(clock_val).value.to_bytes(8, "little"))
         self.uc.reg_write(x86_const.UC_X86_REG_EAX, 1)
 
     def _qpc_freq(self, args):
@@ -816,7 +816,8 @@ class ApiStubs:
         self.uc.reg_write(x86_const.UC_X86_REG_EAX, 1)
 
     def _filetime(self, args):
-        t = self.session.clock + 0x1D48E46000
+        clock_val = self.session.advance_clock(16)
+        t = clock_val + 0x1D48E46000
         if args:
             self.uc.mem_write(args[0], ctypes.c_uint64(t & 0xFFFFFFFFFFFFFFFF).value.to_bytes(8, "little"))
         self.uc.reg_write(x86_const.UC_X86_REG_EAX, 0)

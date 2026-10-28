@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dimensioncoder-python-backend"
 version = "0.2.0"
-description = "DimensionCoding Python Backend（基础后端：状态机/存储/REST 端点/提示词）"
+description = "DimensionCoder Python Backend"
 requires-python = ">=3.9"
 dependencies = [
     "fastapi==0.115.0",
     "uvicorn[standard]==0.32.0",
     "httpx==0.27.0",
-    "cryptography==45.0.4",  # SSH 式密钥登录：ECDSA P-521 公钥解析/验签（2026-08-27）
+    "cryptography==45.0.4",
 ]
 
 [tool.pytest.ini_options]

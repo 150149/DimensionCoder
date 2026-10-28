@@ -164,7 +164,7 @@ class StorageAdapter(ABC):
 
 
     @abstractmethod
-    async def export_for_ai(self, task_id: str, step_id: str, target_dir: str) -> dict:
+    async def export_step_conversation(self, task_id: str, step_id: str, target_dir: str) -> str:
         ...
 
 

@@ -36,6 +36,7 @@ export function useStepStream(
       onStepTokensUpdated: (e) => handlersRef.current.onStepTokensUpdated?.(e),
       onStepStatsUpdated: (e) => handlersRef.current.onStepStatsUpdated?.(e),
       onGateApprovalReady: (e) => handlersRef.current.onGateApprovalReady?.(e),
+      onAskUser: (e) => handlersRef.current.onAskUser?.(e),
       onMessagesReset: (e) => handlersRef.current.onMessagesReset?.(e),
       onReconnect: () => handlersRef.current.onReconnect?.(),
     }

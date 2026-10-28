@@ -1,7 +1,10 @@
 import {useCallback, useEffect, useState} from 'react'
 import {api} from '../api/client'
-import type {ConfigSave, ConfigView, McpServerConfig} from '../api/types'
+import type {ConfigSave, ConfigView, DailyTokenUsage, McpServerConfig} from '../api/types'
 import ErrorToast from '../components/ErrorToast'
+import {DailyTokenChart} from '../components/DailyTokenChart'
+
+const TOKEN_RANGES = [7, 30, 90]
 
 const emptyMcp = (): McpServerConfig => ({
     name: '', type: 'stdio', command: '', args: [], env: {}, url: '', enabled: true,
@@ -41,6 +44,9 @@ export default function SettingsPage() {
     const [mcpEditingIdx, setMcpEditingIdx] = useState(-1)
     const [mcpTestResult, setMcpTestResult] = useState<{ ok: boolean; text: string } | null>(null)
     const [toast, setToast] = useState<{ message: string; variant: 'error' | 'success' } | null>(null)
+    const [tokens, setTokens] = useState<DailyTokenUsage | null>(null)
+    const [tokenDays, setTokenDays] = useState(30)
+    const [tokenError, setTokenError] = useState('')
     const [busy, setBusy] = useState(false)
 
     useEffect(() => {
@@ -83,6 +89,25 @@ export default function SettingsPage() {
             alive = false
         }
     }, [])
+
+    useEffect(() => {
+        let alive = true
+        setTokens(null)
+        setTokenError('')
+        api
+            .getDailyTokens(tokenDays)
+            .then((d) => {
+                if (!alive) return
+                setTokens(d)
+            })
+            .catch((err: unknown) => {
+                if (!alive) return
+                setTokenError(err instanceof Error ? err.message : '统计加载失败')
+            })
+        return () => {
+            alive = false
+        }
+    }, [tokenDays])
 
     const handleChannelInput = useCallback((raw: string) => {
         setChannelInput(raw)
@@ -336,6 +361,29 @@ export default function SettingsPage() {
                                 <div className="field-label">监听地址（只读）</div>
                                 <input className="text-input" value={host} readOnly/>
                             </div>
+                        </div>
+                    </section>
+                    <section className="settings-card wide">
+                        <div className="settings-card-title">
+                            每日 Token 消耗
+                            <span className="dtc-ranges">
+                                {TOKEN_RANGES.map((n) => (
+                                    <button key={n} type="button" className="dtc-range"
+                                            aria-pressed={tokenDays === n}
+                                            onClick={() => setTokenDays(n)}>近 {n} 天</button>
+                                ))}
+                            </span>
+                        </div>
+                        {tokenError && (
+                            <div className="settings-hint">统计加载失败：{tokenError}</div>
+                        )}
+                        {!tokenError && !tokens && (
+                            <div className="settings-hint">统计加载中...</div>
+                        )}
+                        {!tokenError && tokens && <DailyTokenChart items={tokens.items}/>}
+                        <div className="settings-hint">
+                            统计口径：按步骤最后一条活动的日期归日（跨日长步骤的全部累计量记在最后一天、
+                            步骤重跑会归到新最后一天），是活动归属而非逐日账单；全部任务与审查/收尾步骤均计入。
                         </div>
                     </section>
                     <section className="settings-card wide">

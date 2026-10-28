@@ -17,6 +17,7 @@ import {useStepStream} from '../hooks/useStepStream'
 import {useStepMetrics} from '../hooks/useStepMetrics'
 import {useChatAutoScroll} from '../hooks/useChatAutoScroll'
 import {useChatWindow} from '../hooks/useChatWindow'
+import {compressResultText} from '../utils/compressResult'
 
 interface MonitorDetailProps {
     taskId: string
@@ -68,7 +69,7 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
     const [expandedTools, setExpandedTools] = useState<Set<string>>(() => new Set())
     const {
         metrics, metricRequestRef, roundCompRef, sampleFirstChunk, accrueRoundComp,
-        resetStep, endRound, mergeBackend, resetAll,
+        resetStep, endRound, settleRound, mergeBackend, resetAll, noteActivity,
     } = useStepMetrics()
     const [busy, setBusy] = useState(false)
     const [rebuildOpen, setRebuildOpen] = useState(false)
@@ -82,8 +83,8 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
         api
             .getStep(taskId, instId)
             .then((d) => {
-                if (alive && d?.prep?.step_context) {
-                    setPrepInfo({system_prompt: d.prep.system_prompt || '', step_context: d.prep.step_context})
+                if (alive && d?.prep) {
+                    setPrepInfo({system_prompt: d.prep.system_prompt || '', step_context: d.prep.step_context || ''})
                 }
             })
             .catch(() => {
@@ -101,11 +102,11 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
     api
         .getConfig()
         .then((cfg) => {
-          if (alive) {
-            setContextWindow(cfg.contextWindow ?? 400000)
-            setLightPrices({in: cfg.lightInputPrice ?? 0, cached: cfg.lightCachedPrice ?? 0, out: cfg.lightOutputPrice ?? 0})
-              setPowerPrices({in: cfg.powerInputPrice ?? 0, cached: cfg.powerCachedPrice ?? 0, out: cfg.powerOutputPrice ?? 0})
-          }
+            if (alive) {
+                setContextWindow(cfg.contextWindow ?? 400000)
+                setLightPrices({in: cfg.lightInputPrice ?? 0, cached: cfg.lightCachedPrice ?? 0, out: cfg.lightOutputPrice ?? 0})
+                setPowerPrices({in: cfg.powerInputPrice ?? 0, cached: cfg.powerCachedPrice ?? 0, out: cfg.powerOutputPrice ?? 0})
+            }
         })
         .catch(() => {
         })
@@ -130,19 +131,54 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
             return next
         })
     }, [])
-    const {set: toolExpanded} = useToolExpanded(allMsgs, expandedTools)
+    const {set: toolExpanded, sig: toolExpandedSig} = useToolExpanded(allMsgs, expandedTools)
+    const confirmedTailSig = useMemo(() => {
+        const m = confirmedMsgs[confirmedMsgs.length - 1]
+        if (!m) return ''
+        return `${m.seq ?? 'x'}:${(m.content?.length ?? 0) + (m.output?.length ?? 0)
+        + (typeof m.input === 'string' ? m.input.length : 0)}`
+    }, [confirmedMsgs])
     const thinkingText = [...pendingMsgs].reverse().find((m) => m.kind === 'thinking')?.content ?? ''
     const streamText = [...pendingMsgs].reverse().find((m) => m.kind === 'text')?.content ?? ''
     const contentRef = useRef<HTMLDivElement>(null)
     const [autoScrollOn, setAutoScrollOn] = useState(true)
     const monitorRunning = streaming || instStatus === 'active'
+    const [msgTruncated, setMsgTruncated] = useState(false)
+    const [msgTotal, setMsgTotal] = useState<number | null>(null)
+    const [loadingMore, setLoadingMore] = useState(false)
+    const loadEarlier = useCallback(() => {
+        if (loadingMore) return
+        const oldest = storeRef.current.messages.find((m) => m.seq != null)?.seq
+        if (oldest == null) return
+        setLoadingMore(true)
+        api.getStepMessages(taskId, instId, {limit: 200, beforeSeq: oldest})
+            .then((d) => {
+                storeRef.current.prependPage((d.messages ?? []) as unknown[])
+                if (d.truncated != null) setMsgTruncated(!!d.truncated)
+                if (d.total != null) setMsgTotal(d.total)
+            })
+            .finally(() => setLoadingMore(false))
+    }, [taskId, instId, loadingMore])
+    const restMsgs = confirmedMsgs.filter((m) => m.role !== 'system'
+        && !(m.role === 'assistant' && !(m.content ?? '').trim()))
+    const {from, atHead, expand, showJump, setShowJump, jumpToBottom} = useChatWindow({
+        scrollRef: contentRef,
+        count: restMsgs.length,
+        oldestKey: restMsgs[0]?.seq,
+        newestKey: restMsgs[restMsgs.length - 1]?.seq,
+        resetKey: instId,
+        truncated: msgTruncated,
+        onReachTop: msgTruncated ? loadEarlier : undefined,
+    })
     const autoScroll = useChatAutoScroll(
         contentRef,
         [
             allMsgs,
-            streaming,
+            confirmedTailSig,
+            toolExpandedSig,
         ],
         autoScrollOn && monitorRunning,
+        setShowJump,
     )
     const initialScrolledRef = useRef(false)
     useEffect(() => {
@@ -171,7 +207,7 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
             }
             setMonitorSaved(instLive === 'completed')
             if (live) {
-                storeRef.current.loadPage((live.messages ?? []) as unknown[])
+                storeRef.current.loadPage((live.messages ?? []) as unknown[], true)
                 if (live.truncated != null) setMsgTruncated(!!live.truncated)
                 if (live.total != null) setMsgTotal(live.total)
             }
@@ -188,22 +224,6 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
         })
     }, [taskId, instId])
 
-    const [msgTruncated, setMsgTruncated] = useState(false)
-    const [msgTotal, setMsgTotal] = useState<number | null>(null)
-    const [loadingMore, setLoadingMore] = useState(false)
-    const loadEarlier = useCallback(() => {
-        if (loadingMore) return
-        const oldest = storeRef.current.messages.find((m) => m.seq != null)?.seq
-        if (oldest == null) return
-        setLoadingMore(true)
-        api.getStepMessages(taskId, instId, {limit: 200, beforeSeq: oldest})
-            .then((d) => {
-                storeRef.current.prependPage((d.messages ?? []) as unknown[])
-                if (d.truncated != null) setMsgTruncated(!!d.truncated)
-                if (d.total != null) setMsgTotal(d.total)
-            })
-            .finally(() => setLoadingMore(false))
-    }, [taskId, instId, loadingMore])
 
 
     const mountedInstRef = useRef<string | null>(null)
@@ -234,12 +254,14 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
         taskId,
         instId,
         {
-        onChunk: (e) => {
-            sampleFirstChunk()
-            accrueRoundComp(e.chunk.length)
-            store.upsertPending({entityId: e.entityId ?? 'live-text', role: 'assistant', kind: 'text', append: e.chunk})
-        },
+            onChunk: (e) => {
+                noteActivity()
+                sampleFirstChunk()
+                accrueRoundComp(e.chunk.length)
+                store.upsertPending({entityId: e.entityId ?? 'live-text', role: 'assistant', kind: 'text', append: e.chunk})
+            },
             onThinkingChunk: (e) => {
+                noteActivity()
                 sampleFirstChunk()
                 accrueRoundComp(e.chunk.length)
                 store.upsertPending({entityId: e.entityId ?? 'live-thinking', role: 'assistant', kind: 'thinking', append: e.chunk})
@@ -248,19 +270,27 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
                 setStreaming(false)
                 endRound(Date.now())
                 void loadConv()
+                setTimeout(() => {
+                    void loadConv()
+                }, 1500)
             },
             onToolStart: (e) => {
+                noteActivity()
                 storeRef.current.clearPending('thinking')
                 storeRef.current.upsertPending({entityId: e.entityId ?? e.callId, role: 'tool', kind: 'tool', toolName: e.toolName, input: e.input, status: 'streaming'})
             },
             onToolParam: (e) => {
+                noteActivity()
                 accrueRoundComp(e.delta.length)
                 store.upsertPending({entityId: e.entityId ?? e.callId, role: 'tool', kind: 'tool', inputAppend: e.delta})
             },
             onToolResult: (e) => {
                 store.upsertPending({entityId: e.entityId ?? e.callId, role: 'tool', kind: 'tool', output: e.output, status: 'done'})
+                noteActivity()
             },
             onToolExecuting: () => {
+                settleRound()
+                noteActivity()
             },
             onUserMessage: (e) => {
                 store.upsertPending({
@@ -290,8 +320,12 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
             onStepStatsUpdated: (e) => {
                 setMonitorStats((prev) => ({...prev, [instId]: e.stats}))
                 mergeBackend(e.stats)
+                noteActivity()
             },
-            onStepStatus: (e) => setInstStatus((prev) => (e.status ?? prev) as typeof prev),
+            onStepStatus: (e) => {
+                if (e.stepId !== instId) return
+                setInstStatus((prev) => (e.status ?? prev) as typeof prev)
+            },
             onRetryProgress: (e) => setRetryProgress({count: e.retryCount, total: e.total}),
             onRetryClear: () => setRetryProgress(null),
             onRoundAborted: (e) => {
@@ -311,18 +345,10 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
 
 
     const systemMsg = confirmedMsgs.find((m) => m.role === 'system' && m.seq === 0)
-    const restMsgs = confirmedMsgs.filter((m) => m.role !== 'system'
-        && !(m.role === 'assistant' && !(m.content ?? '').trim()))
-
-    const {from, atHead, expand} = useChatWindow({
-        scrollRef: contentRef,
-        count: restMsgs.length,
-        oldestKey: restMsgs[0]?.seq,
-        newestKey: restMsgs[restMsgs.length - 1]?.seq,
-        resetKey: instId,
-        truncated: msgTruncated,
-        onReachTop: msgTruncated ? loadEarlier : undefined,
-    })
+    const sysPromptText = prepInfo?.system_prompt || systemMsg?.content || ''
+    const sysPromptMsg = sysPromptText
+        ? {role: 'system' as const, content: sysPromptText, seq: systemMsg?.seq ?? 0}
+        : null
 
     const title =
         instId === 'review'
@@ -333,18 +359,18 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
                     ? '介入审查'
                     : instId === 'monitor-init'
                         ? '初始编排'
-                      : instId.startsWith('monitor-')
-                          ? `Monitor 审查 ${instId}`
-                          : instId
+                        : instId.startsWith('monitor-')
+                            ? `Monitor 审查 ${instId}`
+                            : instId
 
   const isTailStep = instId === 'monitor-init' || instId === 'review' || instId === 'report'
   const handleSend = useCallback(
       async (content: string) => {
-        if ((taskStatus === 'completed' || monitorSaved) && !isTailStep) {
-          setRebuildPending(content)
-          setRebuildOpen(true)
-          return
-        }
+          if ((taskStatus === 'completed' || monitorSaved) && !isTailStep) {
+              setRebuildPending(content)
+              setRebuildOpen(true)
+              return
+          }
           setBusy(true)
           try {
               await api.stepIntervene(taskId, instId, 'send', content)
@@ -359,7 +385,7 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
   )
 
   const handleRebuildConfirm = useCallback(async () => {
-    const content = rebuildPending
+      const content = rebuildPending
       setRebuildOpen(false)
       setBusy(true)
       try {
@@ -414,144 +440,145 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
   const handleRetry = useCallback(async () => {
     setBusy(true)
     try {
-      await api.resumeStep(taskId, instId)
-      await api.startTask(taskId)
-      setLlmError(null)
+        await api.resumeStep(taskId, instId)
+        await api.startTask(taskId)
+        setLlmError(null)
     } catch (err) {
-      setToast(err instanceof Error ? err.message : '重试失败，请稍后重试')
+        setToast(err instanceof Error ? err.message : '重试失败，请稍后重试')
     } finally {
-      setBusy(false)
+        setBusy(false)
     }
   }, [taskId, instId])
 
-  const handleCompress = useCallback(async () => {
-    setBusy(true)
-    try {
-      await api.compressStep(taskId, instId)
-    } catch (err) {
-      setToast(err instanceof Error ? err.message : '压缩失败，请稍后重试')
-    } finally {
-      setBusy(false)
-    }
-  }, [taskId, instId])
+    const handleCompress = useCallback(async () => {
+        setBusy(true)
+        try {
+            const r = await api.compressStep(taskId, instId)
+            setToast(compressResultText(r))
+        } catch (err) {
+            setToast(err instanceof Error ? err.message : '压缩失败，请稍后重试')
+        } finally {
+            setBusy(false)
+        }
+    }, [taskId, instId])
 
-  return (
-      <>
-        <div className="top-bar top-bar-monitor">
-          <a className="back-btn" onClick={() => navigate(`/task/${taskId}`)}>
-            <Icon name="arrowLeft" size={13} gap={2}/>
-            返回
-          </a>
-          <div className="step-header">
+    return (
+        <>
+            <div className="top-bar top-bar-monitor">
+                <a className="back-btn" onClick={() => navigate(`/task/${taskId}`)}>
+                    <Icon name="arrowLeft" size={13} gap={2}/>
+                    返回
+                </a>
+                <div className="step-header">
             <span className="monitor-title">Monitor 思考过程 — {title}</span>
-            <span className="monitor-badge">Monitor Agent</span>
-          </div>
-          {(!monitorSaved && (instStatus === 'stopped' ||
-              (taskStatus === 'paused' && instStatus === 'pending'))) && (
-              <button className="run-toggle-btn" onClick={handleResume} disabled={busy} title="恢复执行 Monitor">
-                  <Icon name="play" size={13} gap={4}/>
-                  恢复
-              </button>
-          )}
-        </div>
-          <div
-              className="content-area"
-              ref={contentRef}
-          >
-              <div className="chat-log">
-                  {(from > 0 || msgTruncated) && (
-                      <div className="history-fold">
-                          {from > 0 ? (
-                              <button className="history-load-more" onClick={expand}>
-                                  {`显示更早消息（还有 ${from} 条已加载未显示）`}
-                              </button>
-                          ) : (
-                              <button className="history-load-more" onClick={loadEarlier} disabled={loadingMore}>
-                                  {loadingMore ? '加载中...' : `加载更早消息（共 ${msgTotal ?? '?'} 条，已显示 ${restMsgs.length} 条）`}
-                              </button>
-                          )}
-                      </div>
-                  )}
-                  {atHead && systemMsg && <ChatMessage msg={systemMsg}/>}
-                  {atHead && prepInfo?.step_context && (
-                      <div className="msg-user">
-                          <div className="user-bubble">
-                              <Markdown>{prepInfo.step_context}</Markdown>
-                          </div>
-                      </div>
-                  )}
-                  {restMsgs.slice(from).map((m, i) => {
-                      const decision = decisionOf(m)
-                      return (
-                          <Fragment key={m.seq != null ? m.seq : i}>
-                              <ChatMessage msg={m} onToggleTool={toggleTool} expandedTools={toolExpanded}
-                                           autoScroll={autoScrollOn && monitorRunning}/>
-                              {decision && (
-                                  <div className="decision-card">
-                                      <div className="dc-label">Monitor 决策: {decision.action}</div>
-                                      <div className="dc-reasoning">{decision.reasoning}</div>
-                                  </div>
-                              )}
-                          </Fragment>
-                      )
-                  })}
-                  {sentBubbles.map((p) => (
-                      <div className="msg-user" key={p.key}>
-                          <div className={`user-bubble${p.status === 'streaming' ? ' sending' : ''}`}>
-                              {p.content}
-                              {p.status === 'streaming' && (
-                                  <span className="sending-tag">
+                    <span className="monitor-badge">Monitor Agent</span>
+                </div>
+                {(!monitorSaved && (instStatus === 'stopped' ||
+                    (taskStatus === 'paused' && instStatus === 'pending'))) && (
+                    <button className="run-toggle-btn" onClick={handleResume} disabled={busy} title="恢复执行 Monitor">
+                        <Icon name="play" size={13} gap={4}/>
+                        恢复
+                    </button>
+                )}
+            </div>
+            <div
+                className="content-area"
+                ref={contentRef}
+            >
+                <div className="chat-log">
+                    {(from > 0 || msgTruncated) && (
+                        <div className="history-fold">
+                            {from > 0 ? (
+                                <button className="history-load-more" onClick={expand}>
+                                    {`显示更早消息（还有 ${from} 条已加载未显示）`}
+                                </button>
+                            ) : (
+                                <button className="history-load-more" onClick={loadEarlier} disabled={loadingMore}>
+                                    {loadingMore ? '加载中...' : `加载更早消息（共 ${msgTotal ?? '?'} 条，已显示 ${restMsgs.length} 条）`}
+                                </button>
+                            )}
+                        </div>
+                    )}
+                    {atHead && sysPromptMsg && <ChatMessage msg={sysPromptMsg}/>}
+                    {atHead && prepInfo?.step_context && (
+                        <div className="msg-user">
+                            <div className="user-bubble">
+                                <Markdown>{prepInfo.step_context}</Markdown>
+                            </div>
+                        </div>
+                    )}
+                    {restMsgs.slice(from).map((m, i) => {
+                        const decision = decisionOf(m)
+                        return (
+                            <Fragment key={m.seq != null ? m.seq : i}>
+                                <ChatMessage msg={m} onToggleTool={toggleTool} expandedTools={toolExpanded}
+                                             autoScroll={autoScrollOn && monitorRunning}/>
+                                {decision && (
+                                    <div className="decision-card">
+                                        <div className="dc-label">Monitor 决策: {decision.action}</div>
+                                        <div className="dc-reasoning">{decision.reasoning}</div>
+                                    </div>
+                                )}
+                            </Fragment>
+                        )
+                    })}
+                    {sentBubbles.map((p) => (
+                        <div className="msg-user" key={p.key}>
+                            <div className={`user-bubble${p.status === 'streaming' ? ' sending' : ''}`}>
+                                {p.content}
+                                {p.status === 'streaming' && (
+                                    <span className="sending-tag">
                           <span className="loading-spinner"/>
                           发送中…
                         </span>
-                              )}
-                          </div>
-                      </div>
-                  ))}
-                  {liveCards.map((m) => (
-                      <div className="ai-tool-inline" key={m.key}>
-                          <ToolCard callId={m.entityId ?? m.key} toolName={m.toolName ?? ''}
-                                    input={m.input} output={m.output}
-                                    status={m.status === 'done' ? 'done' : 'running'}
-                                    defaultExpanded={toolExpanded.has(m.entityId ?? m.key)}
-                                    autoScroll={autoScrollOn && monitorRunning}
-                                    onToggle={() => toggleTool(m.entityId ?? m.key)}/>
-                      </div>
-                  ))}
-                  {retryProgress != null && (
-                      <div className="retry-progress">
-                          <Icon name="refresh" size={13} gap={8}/>
-                          请求被限流，正在重试 ({retryProgress.count}/{retryProgress.total})...
-                      </div>
-                  )}
-                  {llmError && (
-                      <div className="llm-error-card">
-                          <div className="error-icon">
-                              <Icon name="error" size={20} gap={0}/>
-                          </div>
-                          <div className="error-body">
-                              <strong>LLM 错误: {llmError.code || 'unknown'}</strong>
-                              <div>{llmError.message || '未知错误'}</div>
-                              <div className="error-detail">
-                                  已重试 {llmError.retryCount || 0} 次{llmError.retryable ? '（可重试）' : '（不可重试）'}
-                                  {llmError.model ? ` · 模型 ${llmError.model}` : ''}
-                              </div>
-                              {llmError.retryable && (
-                                  <button className="retry-btn" onClick={handleRetry} disabled={busy}>
-                                      <Icon name="refresh" size={13} gap={5}/>
-                                      重试
-                                  </button>
-                              )}
-                    {!llmError.retryable && (
-                        <button className="retry-btn" onClick={handleResume} disabled={busy}>
-                          <Icon name="play" size={13} gap={5}/>
-                          恢复
-                        </button>
+                                )}
+                            </div>
+                        </div>
+                    ))}
+                    {liveCards.map((m) => (
+                        <div className="ai-tool-inline" key={m.key}>
+                            <ToolCard callId={m.entityId ?? m.key} toolName={m.toolName ?? ''}
+                                      input={m.input} output={m.output}
+                                      status={m.status === 'done' ? 'done' : 'running'}
+                                      defaultExpanded={toolExpanded.has(m.entityId ?? m.key)}
+                                      autoScroll={autoScrollOn && monitorRunning}
+                                      onToggle={() => toggleTool(m.entityId ?? m.key)}/>
+                        </div>
+                    ))}
+                    {retryProgress != null && (
+                        <div className="retry-progress">
+                            <Icon name="refresh" size={13} gap={8}/>
+                            请求被限流，正在重试 ({retryProgress.count}/{retryProgress.total})...
+                        </div>
                     )}
-                  </div>
-                </div>
-            )}
-            {thinkingText && (
+                    {llmError && (
+                        <div className="llm-error-card">
+                            <div className="error-icon">
+                                <Icon name="error" size={20} gap={0}/>
+                            </div>
+                            <div className="error-body">
+                                <strong>LLM 错误: {llmError.code || 'unknown'}</strong>
+                                <div>{llmError.message || '未知错误'}</div>
+                                <div className="error-detail">
+                                    已重试 {llmError.retryCount || 0} 次{llmError.retryable ? '（可重试）' : '（不可重试）'}
+                                    {llmError.model ? ` · 模型 ${llmError.model}` : ''}
+                                </div>
+                                {llmError.retryable && (
+                                    <button className="retry-btn" onClick={handleRetry} disabled={busy}>
+                                        <Icon name="refresh" size={13} gap={5}/>
+                                        重试
+                                    </button>
+                                )}
+                                {!llmError.retryable && (
+                                    <button className="retry-btn" onClick={handleResume} disabled={busy}>
+                                        <Icon name="play" size={13} gap={5}/>
+                                        恢复
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                    {thinkingText && (
                 <div className="ai-thinking-inline">
                   <div className="think-box">
                     <div className="think-body" style={{display: 'block'}}>
@@ -568,10 +595,10 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
                   <div className="ai-text">
                     {streamText ? (
                         <>
-                          {streamText}
-                          <span className="stream-cursor"/>
+                            {streamText}
+                            <span className="stream-cursor"/>
                         </>
-                    ) : (
+                    ) : thinkingText ? null : (
                         <span className="loading-text">
                     <span className="loading-spinner"/>
                     Monitor 正在思考...
@@ -580,31 +607,31 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
                   </div>
                 </div>
             )}
-            {initialLoading ? (
-                <div className="chat-status">加载中...</div>
-            ) : confirmedMsgs.length === 0 && !streaming ? (
-                <div className="chat-status">
-                    该步骤暂无 Monitor 对话记录
-                    <br/>
-                    <small>Monitor 只在实际产生了编排决策时运行</small>
+                    {initialLoading ? (
+                        <div className="chat-status">加载中...</div>
+                    ) : confirmedMsgs.length === 0 && !streaming ? (
+                        <div className="chat-status">
+                            该步骤暂无 Monitor 对话记录
+                            <br/>
+                            <small>Monitor 只在实际产生了编排决策时运行</small>
+                        </div>
+                    ) : null}
                 </div>
-            ) : null}
-          </div>
-          {autoScroll.showJump && (
-              <button className="scroll-jump-btn" onClick={autoScroll.jumpToBottom} title="回到最新输出">
-                <Icon name="chevronDown" size={16} gap={0}/>
-              </button>
-          )}
-        </div>
-        <div className="step-footer">
-          <ContextMeter windowSize={contextWindow} prompt={stepTokens?.prompt ?? 0}/>
-          <InterveneBar
-              mode="flow"
-              onSend={handleSend}
-              onForce={handleForce}
-              onStop={instStatus === 'active' || streaming ? handleStop : undefined}
-              onCompress={handleCompress}
-              running={instStatus === 'active' || streaming}
+                {showJump && (
+                    <button className="scroll-jump-btn" onClick={jumpToBottom} title="回到最新输出">
+                        <Icon name="chevronDown" size={16} gap={0}/>
+                    </button>
+                )}
+            </div>
+            <div className="step-footer">
+                <ContextMeter windowSize={contextWindow} prompt={stepTokens?.prompt ?? 0}/>
+                <InterveneBar
+                    mode="flow"
+                    onSend={handleSend}
+                    onForce={handleForce}
+                    onStop={instStatus === 'active' || streaming ? handleStop : undefined}
+                    onCompress={handleCompress}
+                    running={instStatus === 'active' || streaming}
               busy={busy}
               autoScroll={autoScrollOn}
               onToggleAutoScroll={() => setAutoScrollOn((v) => !v)}
@@ -618,26 +645,26 @@ export default function MonitorDetail({taskId, stepId}: MonitorDetailProps) {
                   + stepTokens.completion * powerPrices.out) / 1e6 : 0)}
               trailing={
                 (() => {
-                  const st = monitorStats?.[instId]
-                  const hasStats = !!st && (st.requests ?? 0) > 0
-                  const live = metrics.startedAt != null
-                  return (
-                      <TokenMetrics
-                          startedAt={metrics.startedAt} endedAt={metrics.endedAt}
-                          activeSince={metrics.activeSince}
-                          ttftMs={metrics.ttftSamples ? metrics.ttftMs
-                              : (hasStats && (st?.ttft_samples ?? 0) > 0
-                                  ? (st?.ttft_total_ms ?? 0) / (st?.ttft_samples ?? 1)
-                                  : null)}
-                          active={instStatus === 'active' || streaming}
-                          runDurationMs={live ? metrics.runDurationMs : (hasStats ? (st?.run_duration_ms ?? 0) : 0)}
-                          outputDurationMs={live ? metrics.outputDurationMs : (hasStats ? (st?.output_duration_ms ?? 0) : 0)}
-                          requestCount={live ? metrics.requests : (hasStats ? (st?.requests ?? 0) : 0)}
-                          completion={live ? metrics.completion : (stepTokens?.completion ?? 0)}
-                          roundFirstAt={live ? (metricRequestRef.current?.firstTokenAt ?? null) : null}
-                          roundComp={live ? roundCompRef.current : 0}
-                      />
-                  )
+                    const st = monitorStats?.[instId]
+                    const hasStats = !!st && (st.requests ?? 0) > 0
+                    const live = metrics.startedAt != null
+                    return (
+                        <TokenMetrics
+                            startedAt={metrics.startedAt} endedAt={metrics.endedAt}
+                            baseAt={metrics.baseAt}
+                            ttftMs={metrics.ttftSamples ? metrics.ttftMs
+                                : (hasStats && (st?.ttft_samples ?? 0) > 0
+                                    ? (st?.ttft_total_ms ?? 0) / (st?.ttft_samples ?? 1)
+                                    : null)}
+                            active={instStatus === 'active' || streaming}
+                            runDurationMs={Math.max(metrics.runDurationMs, st?.run_duration_ms ?? 0)}
+                            outputDurationMs={Math.max(metrics.outputDurationMs, st?.output_duration_ms ?? 0)}
+                            requestCount={Math.max(metrics.requests, st?.requests ?? 0)}
+                            completion={Math.max(metrics.completion, stepTokens?.completion ?? 0)}
+                            roundFirstAt={live ? (metricRequestRef.current?.firstTokenAt ?? null) : null}
+                            roundComp={live ? roundCompRef.current : 0}
+                        />
+                    )
                 })()
               }
           />

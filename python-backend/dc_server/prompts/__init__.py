@@ -11,6 +11,12 @@ def rules_dir() -> str:
     return os.path.join(_PROMPTS_DIR, "rules")
 
 
+def templates_dir() -> str:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, "prompts", "templates")
+    return os.path.join(_PROMPTS_DIR, "templates")
+
+
 @lru_cache(maxsize=16)
 def load_prompt(name: str) -> str:
     path = os.path.join(_PROMPTS_DIR, f"{name}.md")

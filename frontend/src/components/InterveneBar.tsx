@@ -95,7 +95,8 @@ export default function InterveneBar({
                         </button>
                     )}
                     {onCompress && (
-                        <button className="compress-btn" onClick={onCompress} disabled={busy} title="压缩对话历史">
+                        <button className="compress-btn" onClick={onCompress} disabled={busy}
+                                title="压缩 AI 上下文（历史消息保留，不影响展示）">
                             <Icon name="compress" size={14} gap={0}/>
                         </button>
                     )}

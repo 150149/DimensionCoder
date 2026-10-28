@@ -35,7 +35,7 @@ def _setup_static() -> None:
     dist = FRONTEND_DIST
     if not os.path.isdir(dist):
         logger.warning(
-            f"frontend/dist 不存在（{dist}），静态托管暂不可用（N/A：SWP4-E 产出后补验）"
+            f"frontend/dist 不存在（{dist}），静态托管暂不可用"
         )
         return
 

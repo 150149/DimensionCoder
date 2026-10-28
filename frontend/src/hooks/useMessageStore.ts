@@ -31,6 +31,8 @@ export interface PendingPatch {
   roundUid?: string
 }
 
+const TERMINAL_STATUS = new Set<StoreMsg['status']>(['done', 'error'])
+
 let _arrived = 0
 
 function nextArrived(): number {
@@ -86,7 +88,7 @@ export interface MessageStoreApi {
   lastSeq: number
   upsertPending: (patch: PendingPatch) => void
   confirm: (items: ConfirmItem[]) => void
-  loadPage: (rows: unknown[]) => void
+  loadPage: (rows: unknown[], preservePendingUser?: boolean) => void
   prependPage: (rows: unknown[]) => void
   clearPending: (kind?: StoreMsg['kind']) => void
   dropPending: (entityId: string) => void
@@ -115,7 +117,10 @@ export function useMessageStore(): MessageStoreApi {
       if (patch.toolName !== undefined) existing.toolName = patch.toolName
       if (patch.input !== undefined) existing.input = patch.input
       if (patch.output !== undefined) existing.output = patch.output
-      if (patch.status !== undefined) existing.status = patch.status
+      if (patch.status !== undefined
+          && !(TERMINAL_STATUS.has(existing.status) && !TERMINAL_STATUS.has(patch.status))) {
+        existing.status = patch.status
+      }
       if (patch.kind !== undefined) existing.kind = patch.kind
       if (patch.inputAppend !== undefined) {
         existing.input = (typeof existing.input === 'string' ? existing.input : '') + patch.inputAppend
@@ -168,7 +173,7 @@ export function useMessageStore(): MessageStoreApi {
     bump()
   }, [bump])
 
-  const loadPage = useCallback((rows: unknown[]) => {
+  const loadPage = useCallback((rows: unknown[], preservePendingUser = false) => {
     if (!rows.length) return
     const map = msgsRef.current
     const alias = aliasRef.current
@@ -179,6 +184,10 @@ export function useMessageStore(): MessageStoreApi {
       const seqKey = m.seq != null ? `db:${m.seq}` : undefined
       const hit = (aliasHit && sameDbRow(aliasHit.seq, m.seq)) ? aliasHit
           : (seqKey ? map.get(seqKey) : undefined)
+      if (preservePendingUser && hit && hit.state === 'pending'
+          && hit.role === 'user' && m.role === 'user') {
+        continue
+      }
       if (hit) {
         m.key = hit.key
         m.arrivedAt = hit.arrivedAt

@@ -4,6 +4,7 @@ import Sidebar from './panels/Sidebar'
 import FlowOverview from './panels/FlowOverview'
 import StepDetail from './panels/StepDetail'
 import MonitorDetail from './panels/MonitorDetail'
+import ChatDetail from './panels/ChatDetail'
 import SettingsPage from './config/SettingsPage'
 import LoginPage from './panels/LoginPage'
 import {getAuthStatus} from './auth/api'
@@ -23,6 +24,11 @@ function StepDetailRoute() {
 function MonitorDetailRoute() {
   const {taskId, stepId} = useParams()
   return <MonitorDetail taskId={taskId ?? ''} stepId={stepId ?? ''}/>
+}
+
+function ChatDetailRoute() {
+  const {taskId} = useParams()
+  return <ChatDetail taskId={taskId ?? ''}/>
 }
 
 export default function App() {
@@ -74,6 +80,7 @@ export default function App() {
             <Route path="/task/:taskId" element={<FlowOverviewRoute/>}/>
             <Route path="/task/:taskId/step/:stepId" element={<StepDetailRoute/>}/>
             <Route path="/task/:taskId/monitor/:stepId" element={<MonitorDetailRoute/>}/>
+            <Route path="/task/:taskId/chat" element={<ChatDetailRoute/>}/>
             <Route path="/settings" element={<SettingsPage/>}/>
             <Route path="*" element={<Navigate to="/" replace/>}/>
           </Routes>

@@ -11,7 +11,7 @@ from .models.data_models import StepStatus
 from .state_machine.task_types import get_task_type
 from .storage.adapter import StorageAdapter
 from .prompts import load_prompt
-from .prompts.registry import prompt_for_step
+from .prompts.registry import prompt_for_step, load_role_prompt
 
 if TYPE_CHECKING:
     pass
@@ -112,8 +112,9 @@ class MonitorContext:
         completed_conv = context.get("completed_conversations", {})
         for sid, conv_msgs in completed_conv.items():
             fpath = os.path.join(conv_dir, f"{sid}-conversation.json")
+            slim = [{k: v for k, v in m.items() if k != "reasoning"} for m in conv_msgs]
             with open(fpath, "w", encoding="utf-8") as f:
-                json.dump(conv_msgs, f, ensure_ascii=False, indent=2)
+                json.dump(slim, f, ensure_ascii=False, indent=2)
 
         task = context.get("task", {})
         ctx_path = os.path.join(tmp_dir, "task_context.json")
@@ -176,14 +177,14 @@ class MonitorContext:
             user_parts.append("# 待执行步骤\n" + "\n".join(pending_lines))
 
         if include_final_review:
-            user_parts.append(load_prompt(prompt_for_step("review", "review")))
+            user_parts.append(load_role_prompt(prompt_for_step("review", "review")))
 
         current_step = context.get("current_step_id", "")
         if current_step:
             user_parts.append(f"\n刚刚完成的步骤: {current_step}")
 
         messages = [
-            {"role": "system", "content": load_prompt(prompt_for_step("monitor-init", "monitor"))},
+            {"role": "system", "content": load_role_prompt(prompt_for_step("monitor-init", "monitor"))},
             {"role": "user", "content": "\n\n".join(user_parts)},
         ]
 

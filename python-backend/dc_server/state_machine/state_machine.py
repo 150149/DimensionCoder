@@ -63,6 +63,7 @@ class StateMachine:
         epic_id: Optional[str] = None,
         assignee: str = "",
         workspace_dir: Optional[str] = None,
+        mode: str = "flow",
     ) -> str:
         task_id = self._new_id()
         now = self._now()
@@ -77,6 +78,7 @@ class StateMachine:
             "pause_level": None,
             "assignee": assignee,
             "workspace_dir": workspace_dir,
+            "mode": mode if mode in ("flow", "single") else "flow",
             "created_at": now,
             "steps": [],
         }
@@ -277,7 +279,11 @@ class StateMachine:
         if not task:
             raise ValueError(f"Task not found: {task_id}")
 
-        if await self._get_step_status(task_id, step_id) != StepStatus.ACTIVE.value:
+        cur_status = await self._get_step_status(task_id, step_id)
+        if cur_status in (StepStatus.PENDING.value, StepStatus.STOPPED.value):
+            logger.info(f"Step {step_id} already {cur_status}, stop no-op")
+            return
+        if cur_status != StepStatus.ACTIVE.value:
             raise ValueError(f"Step {step_id} is not active, cannot stop")
 
         await self.storage.update_step_status(task_id, step_id, StepStatus.STOPPED.value)

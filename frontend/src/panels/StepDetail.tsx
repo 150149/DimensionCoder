@@ -36,6 +36,7 @@ import {useStepMetrics} from '../hooks/useStepMetrics'
 import {useChatAutoScroll} from '../hooks/useChatAutoScroll'
 import {useChatWindow} from '../hooks/useChatWindow'
 import {extractAskUserPackage, extractDecisionPackage, parseDecisionPackage, toGateApproval,} from '../utils/decisionPkg'
+import {compressResultText} from '../utils/compressResult'
 import CodeTab from '../editor/CodeTab'
 
 interface StepDetailProps {
@@ -69,9 +70,11 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
   const [streaming, setStreaming] = useState(false)
   const {
     metrics, metricRequestRef, roundCompRef, sampleFirstChunk, accrueRoundComp,
-    resetStep, endRound, settleStep, mergeBackend, resetAll,
+    resetStep, endRound, settleRound, settleStep, mergeBackend, resetAll, noteActivity,
   } = useStepMetrics()
   const localMsgIdRef = useRef(0)
+  const toolExecutingRef = useRef(false)
+  const stepStatusRef = useRef('')
   const [llmError, setLlmError] = useState<LlmErrorEvent | null>(null)
   const [retryProgress, setRetryProgress] = useState<{ count: number, total: number } | null>(null)
   const [busy, setBusy] = useState(false)
@@ -83,13 +86,13 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
 
   const absorbLive = useCallback((l: StepLive | null | undefined) => {
     if (!l) return
-    if (l.streaming) setStreaming(true)
+    setStreaming(l.streaming === true)
     const up = storeRef.current.upsertPending
     const rid = l.roundUid ?? 'live'
     if (l.thinking) up({entityId: rid, kind: 'thinking', role: 'assistant', content: l.thinking})
     if (l.text) up({entityId: rid, kind: 'text', role: 'assistant', content: l.text})
     for (const t of l.tools ?? []) {
-      up({entityId: t.callId, kind: 'tool', role: 'tool', toolName: t.name, input: t.input, output: t.output ?? undefined, status: t.status})
+      up({entityId: t.callId, kind: 'tool', role: 'tool', toolName: t.name, input: t.input, output: t.output ?? undefined, status: t.status, roundUid: l.roundUid ?? undefined})
     }
   }, [])
 
@@ -117,6 +120,9 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
       [gateDoc?.content])
   const [askSelected, setAskSelected] = useState<number | null>(null)
   const [askAnswer, setAskAnswer] = useState('')
+  const [askUserEvt, setAskUserEvt] = useState<{
+    question: string; options?: string[]; callId: string
+  } | null>(null)
   const latestAssistant = useMemo(() => {
     const msgs = data?.conversation ?? []
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -136,13 +142,6 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
           || (data?.conversation ?? []).some((m) => m.role === 'assistant' && parseDecisionPackage(m.content ?? '')),
       [approval, data],
   )
-  const lastAskUserSeq = useMemo(() => {
-    let seq: number | null = null
-    for (const m of data?.conversation ?? []) {
-      if (m.role === 'assistant' && m.seq != null && extractAskUserPackage(m.content ?? '')) seq = m.seq
-    }
-    return seq
-  }, [data])
   const handleChooseConfirm = useCallback(async () => {
     const custom = customText.trim()
     if (selectedOpt == null && !custom) return
@@ -226,8 +225,15 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
       try {
         const d = await api.getStep(taskId, stepId, {limit: 200})
         setData(d)
-        storeRef.current.loadPage((d.conversation ?? []) as unknown[])
+        storeRef.current.loadPage((d.conversation ?? []) as unknown[], true)
         absorbLive(d.live)
+        if (d.pendingQuestion) {
+          setAskUserEvt({
+            question: d.pendingQuestion.question,
+            options: d.pendingQuestion.options,
+            callId: '',
+          })
+        }
         if (!d.live && d.step?.status === 'active') {
           setStreaming(true)
         }
@@ -266,6 +272,33 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
     mergeBackend(step)
   }), [taskId, stepId, mergeBackend])
 
+  const finalizeStep = useCallback(async () => {
+    const st = storeRef.current
+    if (!st.messages.some((m) => m.state === 'pending' && m.kind === 'tool')) return
+    if (st.lastSeq >= 0) {
+      try {
+        const d = await api.getStepMessages(taskId, stepId, {afterSeq: st.lastSeq, limit: 200})
+        storeRef.current.loadPage((d.messages ?? []) as unknown[])
+      } catch {
+        return
+      }
+    }
+    storeRef.current.clearPending('thinking')
+    storeRef.current.clearPending('tool')
+  }, [taskId, stepId])
+
+  const curStepStatus = task?.steps?.find((s) => s.step_id === stepId)?.status ?? ''
+  useEffect(() => {
+    const prev = stepStatusRef.current
+    stepStatusRef.current = curStepStatus
+    if (!prev || prev === curStepStatus) return
+    if (curStepStatus === 'pending' || curStepStatus === 'active') return
+    const t = setTimeout(() => {
+      void finalizeStep()
+    }, 1500)
+    return () => clearTimeout(t)
+  }, [curStepStatus, finalizeStep])
+
   useEffect(() => {
     loadMeta()
   }, [loadMeta])
@@ -301,11 +334,13 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
   }, [])
 
 
+
   const handleChunk = useCallback((e: StreamChunkEvent) => {
+    noteActivity()
     sampleFirstChunk()
     accrueRoundComp(e.chunk.length)
     storeRef.current.upsertPending({entityId: e.entityId ?? 'live-text', kind: 'text', role: 'assistant', append: e.chunk})
-  }, [sampleFirstChunk, accrueRoundComp])
+  }, [sampleFirstChunk, accrueRoundComp, noteActivity])
 
   const handleStepStart = useCallback(() => {
     setStreaming(true)
@@ -313,6 +348,9 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
     resetStep(at)
     setLlmError(null)
     storeRef.current.clearPending()
+    setApprovalReady(null)
+    setGateDoc(null)
+    toolExecutingRef.current = false
   }, [resetStep])
 
 
@@ -321,8 +359,12 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
     const at = Date.now()
     endRound(at)
     storeRef.current.clearPending('thinking')
+    toolExecutingRef.current = false
     void loadMeta()
-  }, [endRound, loadMeta])
+    setTimeout(() => {
+      void finalizeStep()
+    }, 1500)
+  }, [endRound, loadMeta, finalizeStep])
 
   const handleUserMessage = useCallback((e: UserMessageEvent) => {
     const st = storeRef.current
@@ -336,47 +378,55 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
       entityId: e.entityId ?? (e.msgSeq != null ? `db:${e.msgSeq}` : `um-local-${e.seq}`),
       role: 'user',
       content: e.message,
-      status: 'done',
     })
   }, [])
 
   const handleThinkingChunk = useCallback(
       (e: ThinkingChunkEvent) => {
+        noteActivity()
+        if (toolExecutingRef.current) return
         sampleFirstChunk()
         accrueRoundComp(e.chunk.length)
         storeRef.current.upsertPending({entityId: e.entityId ?? 'live-thinking', kind: 'thinking', role: 'assistant', append: e.chunk})
       },
-      [sampleFirstChunk, accrueRoundComp],
+      [sampleFirstChunk, accrueRoundComp, noteActivity],
   )
 
   const handleToolStart = useCallback(
       (e: ToolCallStartEvent) => {
+        noteActivity()
         storeRef.current.upsertPending({entityId: e.entityId ?? e.callId, kind: 'tool', role: 'tool', toolName: e.toolName, input: e.input, status: 'streaming'})
       },
-      [],
+      [noteActivity],
   )
 
   const handleToolParam = useCallback(
       (e: ToolCallParamEvent) => {
+        noteActivity()
         storeRef.current.upsertPending({entityId: e.entityId ?? e.callId, kind: 'tool', role: 'tool', inputAppend: e.delta})
         accrueRoundComp(e.delta.length)
       },
-      [accrueRoundComp],
+      [accrueRoundComp, noteActivity],
   )
 
   const handleToolExecuting = useCallback(() => {
     setStreaming(false)
     storeRef.current.clearPending('thinking')
-  }, [])
+    toolExecutingRef.current = true
+    settleRound()
+    noteActivity()
+  }, [settleRound, noteActivity])
 
   const handleToolResult = useCallback(
       (e: ToolCallResultEvent) => {
         storeRef.current.upsertPending({entityId: e.entityId ?? e.callId, kind: 'tool', role: 'tool', output: e.output, status: 'done'})
         setStreaming(true)
+        toolExecutingRef.current = false
         const req = metricRequestRef.current
         if (req) req.reqStartedAt = Date.now()
+        noteActivity()
       },
-      [],
+      [noteActivity],
   )
 
   const handleLlmError = useCallback(
@@ -422,15 +472,23 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
     },
     onTaskUpdated: handleTaskUpdated,
     onStepStatus: handleStepStatus,
-    onStepStatsUpdated: (e) => mergeBackend(e.stats),
+    onStepStatsUpdated: (e) => {
+      mergeBackend(e.stats)
+      noteActivity()
+    },
     onGateApprovalReady: (e) => setApprovalReady(e.approval),
+    onAskUser: (e) => setAskUserEvt({
+      question: e.question, options: e.options, callId: e.callId
+    }),
     onMessagesConfirmed: (e) => storeRef.current.confirm(e.items),
     onMessagesReset: () => {
       storeRef.current.reset()
       void loadStep()
     },
     onReconnect: () => {
-      void loadStep()
+      void loadMeta()
+      if (stepStatusRef.current === 'active') void loadStep()
+      else void finalizeStep()
     },
   }, undefined, () => storeRef.current.lastSeq)
 
@@ -449,12 +507,19 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
           }
         } catch (err) {
           if (isMsg) storeRef.current.dropPending(localId)
-          setToast(err instanceof Error ? err.message : '发送失败，请稍后重试')
+          const msg = err instanceof Error ? err.message : ''
+          if (mode === 'stop' && /cannot stop|not active/i.test(msg)) {
+            setStreaming(false)
+            void loadMeta()
+            setToast('该步骤已停止或未在运行，已刷新状态')
+          } else {
+            setToast(msg || '发送失败，请稍后重试')
+          }
         } finally {
           setBusy(false)
         }
       },
-      [taskId, stepId, loadStep],
+      [taskId, stepId, loadStep, loadMeta],
   )
   const intervene = useCallback(
       async (mode: 'send' | 'force_inject' | 'stop', content: string) => {
@@ -491,14 +556,14 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
   const handleCompress = useCallback(async () => {
     setBusy(true)
     try {
-      await api.compressStep(taskId, stepId)
-      void loadStep()
+      const r = await api.compressStep(taskId, stepId)
+      setToast(compressResultText(r))
     } catch (err) {
       setToast(err instanceof Error ? err.message : '压缩失败，请稍后重试')
     } finally {
       setBusy(false)
     }
-  }, [taskId, stepId, loadStep])
+  }, [taskId, stepId])
 
   const toggleTool = useCallback((callId: string) => {
     setExpandedTools((prev) => {
@@ -532,7 +597,19 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
     for (const m of pendingMsgs) {
       if (m.role === 'user') continue
       if (m.kind === 'tool') {
-        if (!last) {
+        if (m.toolName === 'dcflow_ask_user') continue
+        if (m.roundUid) {
+          let g = byId.get(m.roundUid)
+          if (!g) {
+            g = {id: m.roundUid, thinking: '', text: '', tools: []}
+            byId.set(m.roundUid, g)
+            groups.push(g)
+          }
+          g.tools.push(m)
+          last = g
+          continue
+        }
+        if (!last || last.thinking || last.text) {
           last = {id: `g-${m.key}`, thinking: '', text: '', tools: []}
           groups.push(last)
         }
@@ -556,7 +633,19 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
   const {set: toolExpanded, sig: toolExpandedSig} = useToolExpanded(allMsgs, expandedTools)
   const contentRef = useRef<HTMLDivElement>(null)
   const [autoScrollOn, setAutoScrollOn] = useState(true)
-  const stepRunning = streaming || steps.find((s) => s.step_id === stepId)?.status === 'active'
+  const stepRunning = curStepStatus === 'active'
+      || (streaming && !['stopped', 'completed', 'skipped'].includes(curStepStatus))
+  const restMsgs = confirmedMsgs.filter((m) => m.role !== 'system'
+      && !(m.role === 'assistant' && !(m.content ?? '').trim()))
+  const {from, atHead, expand, showJump, setShowJump, jumpToBottom} = useChatWindow({
+    scrollRef: contentRef,
+    count: restMsgs.length,
+    oldestKey: restMsgs[0]?.seq,
+    newestKey: restMsgs[restMsgs.length - 1]?.seq,
+    resetKey: stepId,
+    truncated: !!data?.truncated,
+    onReachTop: data?.truncated ? loadEarlier : undefined,
+  })
   const autoScroll = useChatAutoScroll(
       contentRef,
       [
@@ -565,13 +654,13 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
             + (m.output?.length ?? 0), 0),
         pendingMsgs.length,
         confirmedTailSig,
-        toolExpandedSig,
         data?.max_seq,
         llmError,
         retryProgress,
         streaming,
       ],
       autoScrollOn && stepRunning,
+      setShowJump,
   )
   const initialScrolledRef = useRef(false)
   useEffect(() => {
@@ -607,7 +696,7 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
   const contextTokens = curStep?.context_tokens ?? 0
   const tokenPrompt = curStep?.token_prompt ?? 0
   const tokenCached = curStep?.token_cached ?? 0
-  const tokenCompletion = metrics.startedAt != null ? metrics.completion : (curStep?.token_completion ?? 0)
+  const tokenCompletion = Math.max(metrics.completion, curStep?.token_completion ?? 0)
   const prices = (curStep?.model_tier ?? 'power') === 'light' ? lightPrices : powerPrices
   const totalCost = (Math.max(0, tokenPrompt - tokenCached) * prices.in
       + tokenCached * prices.cached + tokenCompletion * prices.out) / 1e6
@@ -615,12 +704,16 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
   const isGatePending =
       curStep?.status === 'active' && curStep?.human_attention === 'gate' && task?.status === 'paused'
 
+  const _gateStep = curStep?.human_attention === 'gate'
   useEffect(() => {
-    if (!isGatePending || !approval) {
-      setGateDoc(null)
-      setGateDocLoading(false)
+    if (!_gateStep || !approval) {
+      if (!_gateStep) {
+        setGateDoc(null)
+        setGateDocLoading(false)
+      }
       return
     }
+    if (gateDoc?.content || gateDoc?.error) return
     let cancelled = false
     setGateDocLoading(true)
     api.getGateDoc(taskId, stepId)
@@ -641,28 +734,33 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
     return () => {
       cancelled = true
     }
-  }, [isGatePending, approval, taskId, stepId])
+  }, [_gateStep, approval, taskId, stepId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const askPending = Boolean(lastAskUserSeq != null && curStep?.status === 'stopped')
-  const askPkg = useMemo(() => {
-    for (let i = (data?.conversation ?? []).length - 1; i >= 0; i--) {
-      const m = data!.conversation[i]
-      if (m.role !== 'assistant') continue
-      const ap = extractAskUserPackage(m.content ?? '')
-      if (ap) return ap.pkg
-    }
-    return null
-  }, [data])
+  const askPending = askUserEvt != null
   const handleAskSubmit = useCallback(async () => {
-    if (!askPkg) return
+    if (!askUserEvt) return
     const custom = askAnswer.trim()
     if (askSelected == null && !custom) return
-    const answer = custom || String(askPkg.options?.[askSelected ?? -1] ?? '')
+    const answer = custom || String(askUserEvt.options?.[askSelected ?? -1] ?? '')
     if (!answer) return
-    await doIntervene('send', `【问答回复】${askPkg.question}\n→ ${answer}`)
-    setAskSelected(null)
-    setAskAnswer('')
-  }, [askPkg, askAnswer, askSelected, doIntervene])
+    setBusy(true)
+    try {
+      const res = await fetch('/api/step/answer', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_id: taskId, step_id: stepId, answer}),
+      })
+      if (!res.ok) {
+        console.error('ask_user answer failed:', res.status)
+        return
+      }
+      setAskUserEvt(null)
+      setAskSelected(null)
+      setAskAnswer('')
+    } finally {
+      setBusy(false)
+    }
+  }, [askUserEvt, askAnswer, askSelected, taskId, stepId])
 
   const canResume = curStep?.status === 'stopped'
       || (curStep?.status === 'pending' && task?.status === 'paused')
@@ -707,18 +805,10 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
 
 
   const systemMsg = confirmedMsgs.find((m) => m.role === 'system' && m.seq === 0)
-  const restMsgs = confirmedMsgs.filter((m) => m.role !== 'system'
-      && !(m.role === 'assistant' && !(m.content ?? '').trim()))
-
-  const {from, atHead, expand} = useChatWindow({
-    scrollRef: contentRef,
-    count: restMsgs.length,
-    oldestKey: restMsgs[0]?.seq,
-    newestKey: restMsgs[restMsgs.length - 1]?.seq,
-    resetKey: stepId,
-    truncated: !!data?.truncated,
-    onReachTop: data?.truncated ? loadEarlier : undefined,
-  })
+  const sysPromptText = data?.prep?.system_prompt || systemMsg?.content || ''
+  const sysPromptMsg = sysPromptText
+      ? {role: 'system' as const, content: sysPromptText, seq: systemMsg?.seq ?? 0}
+      : null
 
   return (
       <>
@@ -800,7 +890,7 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                         )}
                       </div>
                   )}
-                  {atHead && systemMsg && <ChatMessage msg={systemMsg}/>}
+                  {atHead && sysPromptMsg && <ChatMessage msg={sysPromptMsg}/>}
                   {atHead && data?.prep?.step_context && (
                       <div className="msg-user">
                         <div className="user-bubble">
@@ -811,63 +901,13 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                   {restMsgs.slice(from).map((m, i) => {
                     const ap = m.role === 'assistant' ? extractAskUserPackage(m.content ?? '') : null
                     if (ap) {
-                      const isLastAsk = m.seq != null && m.seq === lastAskUserSeq
                       return (
-                          <Fragment key={m.seq != null ? m.seq : i}>
-                            <ChatMessage
-                                msg={{...m, content: ap.before + ap.after}}
-                                onToggleTool={toggleTool}
-                                expandedTools={expandedTools}
-                            />
-                            {askPending && isLastAsk && (
-                                <div className="ask-card">
-                                  <div className="ask-head">
-                                    <Icon name="message" size={13} gap={6}/>
-                                    需求澄清 — AI 在等待你的回答
-                                  </div>
-                                  <div className="ask-question">
-                                    <Markdown>{ap.pkg.question}</Markdown>
-                                  </div>
-                                  {ap.pkg.options && ap.pkg.options.length > 0 && (
-                                      <div className="ask-options">
-                                        {ap.pkg.options.map((opt, j) => (
-                                            <button
-                                                key={j}
-                                                className={`ask-option${askSelected === j ? ' selected' : ''}`}
-                                                onClick={() => {
-                                                  setAskSelected(j)
-                                                  setAskAnswer('')
-                                                }}
-                                            >
-                                              {opt}
-                                            </button>
-                                        ))}
-                                      </div>
-                                  )}
-                                  <div className="ask-custom">
-                                    <textarea
-                                        rows={2}
-                                        placeholder="或输入你自己的回答…"
-                                        value={askAnswer}
-                                        onChange={(e) => {
-                                          setAskAnswer(e.target.value)
-                                          setAskSelected(null)
-                                        }}
-                                    />
-                                  </div>
-                                  <div className="ask-actions">
-                                    <button
-                                        className="btn btn-primary"
-                                        disabled={busy || (askSelected == null && !askAnswer.trim())}
-                                        onClick={() => void handleAskSubmit()}
-                                    >
-                                      <Icon name="check" size={13} gap={5}/>
-                                      发送回答
-                                    </button>
-                                  </div>
-                                </div>
-                            )}
-                          </Fragment>
+                          <ChatMessage
+                              key={m.seq != null ? m.seq : i}
+                              msg={{...m, content: ap.before + ap.after}}
+                              onToggleTool={toggleTool}
+                              expandedTools={expandedTools}
+                          />
                       )
                     }
                     const dp = m.role === 'assistant' ? extractDecisionPackage(m.content ?? '') : null
@@ -921,7 +961,8 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                           ) : (
                               isLast &&
                               streaming &&
-                              !r.thinking && (
+                              !r.thinking &&
+                              r.tools.length === 0 && (
                                   <div className="ai-block">
                                     <div className="ai-text">
                         <span className="loading-text">
@@ -951,6 +992,54 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                         </Fragment>
                     )
                   })}
+                  {askPending && askUserEvt && (
+                      <div className="ask-card">
+                        <div className="ask-head">
+                          <Icon name="message" size={13} gap={6}/>
+                          需求澄清 — AI 在等待你的回答
+                        </div>
+                        <div className="ask-question">
+                          <Markdown>{askUserEvt.question}</Markdown>
+                        </div>
+                        {askUserEvt.options && askUserEvt.options.length > 0 && (
+                            <div className="ask-options">
+                              {askUserEvt.options.map((opt, j) => (
+                                  <button
+                                      key={j}
+                                      className={`ask-option${askSelected === j ? ' selected' : ''}`}
+                                      onClick={() => {
+                                        setAskSelected(j)
+                                        setAskAnswer('')
+                                      }}
+                                  >
+                                    {opt}
+                                  </button>
+                              ))}
+                            </div>
+                        )}
+                        <div className="ask-custom">
+                          <textarea
+                              rows={2}
+                              placeholder="或输入你自己的回答…"
+                              value={askAnswer}
+                              onChange={(e) => {
+                                setAskAnswer(e.target.value)
+                                setAskSelected(null)
+                              }}
+                          />
+                        </div>
+                        <div className="ask-actions">
+                          <button
+                              className="btn btn-primary"
+                              disabled={busy || (askSelected == null && !askAnswer.trim())}
+                              onClick={() => void handleAskSubmit()}
+                          >
+                            <Icon name="check" size={13} gap={5}/>
+                            发送回答
+                          </button>
+                        </div>
+                      </div>
+                  )}
                   {roundGroups.length === 0 && streaming && (
                       <div className="ai-block">
                         <div className="ai-text">
@@ -1002,7 +1091,7 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                       </div>
                   )}
                   {curStep?.human_attention === 'gate' ? <CodeDiagram taskId={taskId}/> : null}
-                  {isGatePending && approval && (
+                  {_gateStep && (gateDoc || gateDocLoading) && (
                       <div className="gate-doc">
                         {gateDocLoading ? (
                             <div className="gate-doc-loading">
@@ -1124,8 +1213,8 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                   )}
                   {!data && <div className="chat-status">加载中...</div>}
                 </div>
-                {autoScroll.showJump && (
-                    <button className="scroll-jump-btn" onClick={autoScroll.jumpToBottom} title="回到最新输出">
+                {showJump && (
+                    <button className="scroll-jump-btn" onClick={jumpToBottom} title="回到最新输出">
                       <Icon name="chevronDown" size={16} gap={0}/>
                     </button>
                 )}
@@ -1136,9 +1225,9 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                     mode="step"
                     onSend={(content) => intervene('send', content)}
                     onForce={(content) => intervene('force_inject', content)}
-                    onStop={streaming || curStep?.status === 'active' ? () => intervene('stop', '打断') : undefined}
+                    onStop={stepRunning ? () => intervene('stop', '打断') : undefined}
                     onCompress={handleCompress}
-                    running={streaming || curStep?.status === 'active'}
+                    running={stepRunning}
                     busy={busy}
                     autoScroll={autoScrollOn}
                     onToggleAutoScroll={() => setAutoScrollOn((v) => !v)}
@@ -1147,18 +1236,15 @@ export default function StepDetail({taskId, stepId}: StepDetailProps) {
                               cost={totalCost}
                               trailing={
                                 <TokenMetrics startedAt={metrics.startedAt} endedAt={metrics.endedAt}
-                                              activeSince={metrics.activeSince}
+                                              baseAt={metrics.baseAt}
                                               ttftMs={metrics.ttftSamples ? metrics.ttftMs
                                                   : ((curStep?.ttft_samples ?? 0) > 0
                                                       ? ((curStep?.ttft_total_ms ?? 0) / (curStep?.ttft_samples ?? 1))
                                                       : null)}
                                               active={curStep?.status === 'active' || streaming}
-                                              runDurationMs={metrics.startedAt != null
-                                                  ? metrics.runDurationMs : (curStep?.run_duration_ms ?? 0)}
-                                              outputDurationMs={metrics.startedAt != null
-                                                  ? metrics.outputDurationMs : (curStep?.output_duration_ms ?? 0)}
-                                              requestCount={metrics.startedAt != null
-                                                  ? metrics.requests : (curStep?.requests ?? 0)}
+                                              runDurationMs={Math.max(metrics.runDurationMs, curStep?.run_duration_ms ?? 0)}
+                                              outputDurationMs={Math.max(metrics.outputDurationMs, curStep?.output_duration_ms ?? 0)}
+                                              requestCount={Math.max(metrics.requests, curStep?.requests ?? 0)}
                                               completion={tokenCompletion}
                                               roundFirstAt={metrics.startedAt != null
                                                   ? (metricRequestRef.current?.firstTokenAt ?? null) : null}

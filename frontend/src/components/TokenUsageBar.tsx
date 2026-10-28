@@ -9,8 +9,8 @@ interface TokenMetricsProps {
   startedAt: number | null
   endedAt: number | null
   active: boolean
-  activeSince: number | null
-  runDurationMs: number
+    baseAt: number | null
+    runDurationMs: number
   outputDurationMs: number
   ttftMs: number | null
   requestCount: number
@@ -25,31 +25,32 @@ function formatDuration(seconds: number): string {
 }
 
 export const TokenMetrics = memo(function TokenMetrics({
-                                                         startedAt,
-                                                         endedAt,
-                                                         active,
-                                                         activeSince,
-                                                         runDurationMs,
-                                                         outputDurationMs,
-                                                         ttftMs,
-                                                         requestCount,
-                                                         completion,
-                                                         roundFirstAt,
-                                                         roundComp
+                                                           startedAt,
+                                                           endedAt,
+                                                           active,
+                                                           baseAt,
+                                                           runDurationMs,
+                                                           outputDurationMs,
+                                                           ttftMs,
+                                                           requestCount,
+                                                           completion,
+                                                           roundFirstAt,
+                                                           roundComp
                                                        }: TokenMetricsProps) {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!active || endedAt != null) return
-    const timer = window.setInterval(() => setNow(Date.now()), 1000)
-    return () => window.clearInterval(timer)
-  }, [active, endedAt])
-  const hasRun = startedAt != null || runDurationMs > 0
-  const elapsed = (runDurationMs + (active && endedAt == null ? now - (activeSince ?? now) : 0)) / 1000
-  const liveOut = outputDurationMs + (roundFirstAt != null ? now - roundFirstAt : 0)
-  const totalComp = completion + (roundComp ?? 0)
-  const speed = liveOut > 0 && totalComp > 0 ? totalComp / (liveOut / 1000) : null
-  const dash = <span className="tus-dim">--</span>
-  return <span className="tus-metrics" aria-label="步骤运行统计">
+    const [now, setNow] = useState(() => Date.now())
+    useEffect(() => {
+        if (!active || endedAt != null) return
+        const timer = window.setInterval(() => setNow(Date.now()), 1000)
+        return () => window.clearInterval(timer)
+    }, [active, endedAt])
+    const hasRun = startedAt != null || runDurationMs > 0
+    const elapsed = (runDurationMs + (active && endedAt == null
+        ? Math.max(0, now - (baseAt ?? now)) : 0)) / 1000
+    const liveOut = outputDurationMs + (roundFirstAt != null ? now - roundFirstAt : 0)
+    const totalComp = completion + (roundComp ?? 0)
+    const speed = liveOut > 0 && totalComp > 0 ? totalComp / (liveOut / 1000) : null
+    const dash = <span className="tus-dim">--</span>
+    return <span className="tus-metrics" aria-label="步骤运行统计">
     <span className="tus-metric">输出速度 <b className="tus-val">{speed == null ? dash : `${speed.toFixed(1)} token/s`}</b></span>
     <span className="tus-metric-sep">|</span>
     <span className="tus-metric">首字延迟 <b className="tus-val">{ttftMs == null ? dash : `${(ttftMs / 1000).toFixed(3)}秒`}</b></span>

@@ -213,7 +213,6 @@ DimensionCoder/
 │       ├── monitor_context.py   # Monitor 编排上下文
 │       ├── graceful.py          # 优雅关闭 / 重启恢复
 │       ├── tool_security.py     # 工具路径安全（越界防护）
-│       ├── API.md               # REST API 契约文档
 │       ├── brain/               # LLM 与编排：llm_client / orchestrator / mcp_client / sse_hub
 │       ├── state_machine/       # 任务与步骤状态机、任务类型
 │       ├── storage/             # SQLite 持久化（adapter / sqlite_adapter / 迁移）

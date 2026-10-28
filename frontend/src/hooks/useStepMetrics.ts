@@ -3,7 +3,7 @@ import {useCallback, useRef, useState} from 'react'
 export interface StepMetricsState {
   startedAt: number | null
   endedAt: number | null
-  activeSince: number | null
+  baseAt: number | null
   runDurationMs: number
   outputDurationMs: number
   ttftMs: number | null
@@ -32,7 +32,7 @@ interface RoundTiming {
 const EMPTY: StepMetricsState = {
   startedAt: null,
   endedAt: null,
-  activeSince: null,
+  baseAt: null,
   runDurationMs: 0,
   outputDurationMs: 0,
   ttftMs: null,
@@ -73,25 +73,20 @@ export function useStepMetrics() {
   const resetStep = useCallback((at: number) => {
     metricRequestRef.current = {stepStartedAt: at, reqStartedAt: at, firstTokenAt: null, lastChunkAt: null}
     roundCompRef.current = 0
-    setMetrics((m) => ({...m, startedAt: m.startedAt ?? at, endedAt: null, activeSince: at}))
+    setMetrics((m) => ({...m, startedAt: m.startedAt ?? at, endedAt: null, baseAt: at}))
   }, [])
 
   const endRound = useCallback((at: number) => {
     const req = metricRequestRef.current
-    const firstAt = req?.firstTokenAt ?? null
-    const lastAt = req?.lastChunkAt ?? null
     const stepStartAt = req?.stepStartedAt ?? at
     setMetrics((m) => {
       if (req == null) return {...m, endedAt: at}
-      const out = firstAt != null && lastAt != null
-          ? m.outputDurationMs + (lastAt - firstAt)
-          : m.outputDurationMs
+      const runMs = at - stepStartAt
       return {
         ...m,
         endedAt: at,
-        activeSince: null,
-        runDurationMs: at - stepStartAt,
-        outputDurationMs: out,
+        runDurationMs: runMs,
+        baseAt: runMs >= m.runDurationMs ? at : m.baseAt,
         requests: m.requests + 1,
       }
     })
@@ -103,10 +98,25 @@ export function useStepMetrics() {
     roundCompRef.current = 0
   }, [])
 
+  const settleRound = useCallback(() => {
+    const req = metricRequestRef.current
+    if (req) {
+      req.firstTokenAt = null
+      req.lastChunkAt = null
+    }
+    roundCompRef.current = 0
+  }, [])
+
   const settleStep = useCallback((at: number) => {
     const req = metricRequestRef.current
     const stepStartAt = req?.stepStartedAt ?? at
-    setMetrics((m) => ({...m, endedAt: at, activeSince: null, runDurationMs: at - stepStartAt}))
+    setMetrics((m) => {
+      const runMs = at - stepStartAt
+      return {
+        ...m, endedAt: at, runDurationMs: runMs,
+        baseAt: runMs >= m.runDurationMs ? at : m.baseAt
+      }
+    })
   }, [])
 
   const mergeBackend = useCallback((st: StepStatsLike | null | undefined) => {
@@ -116,11 +126,13 @@ export function useStepMetrics() {
     setMetrics((m) => {
       const ttftTotalMs = Math.max(m.ttftTotalMs, st.ttft_total_ms ?? 0)
       const ttftSamples = Math.max(m.ttftSamples, st.ttft_samples ?? 0)
+      const runMs = Math.max(m.runDurationMs, st.run_duration_ms ?? 0)
       return {
         ...m,
         requests: Math.max(m.requests, requests),
         outputDurationMs: Math.max(m.outputDurationMs, st.output_duration_ms ?? 0),
-        runDurationMs: Math.max(m.runDurationMs, st.run_duration_ms ?? 0),
+        runDurationMs: runMs,
+        baseAt: runMs > m.runDurationMs ? Date.now() : m.baseAt,
         completion: Math.max(m.completion, st.token_completion ?? 0),
         ttftTotalMs,
         ttftSamples,
@@ -135,8 +147,12 @@ export function useStepMetrics() {
     setMetrics(EMPTY)
   }, [])
 
+  const noteActivity = useCallback(() => {
+    setMetrics((m) => (m.endedAt != null ? {...m, endedAt: null} : m))
+  }, [])
+
   return {
     metrics, metricRequestRef, roundCompRef, sampleFirstChunk, accrueRoundComp,
-    resetStep, endRound, settleStep, mergeBackend, resetAll,
+    resetStep, endRound, settleRound, settleStep, mergeBackend, resetAll, noteActivity,
   }
 }

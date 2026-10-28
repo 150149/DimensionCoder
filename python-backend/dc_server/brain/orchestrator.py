@@ -27,6 +27,7 @@ from ..step_context import (
     project_asset_local_path as _project_asset_local_path,
     read_asset_file as _read_asset_file,
     write_asset_file as _write_asset_file,
+    get_step_temp_dir,
 )
 from .llm_client import LlmAborted, LlmError
 from .mcp_client import mcp_manager, McpError
@@ -57,14 +58,6 @@ _PROGRESS_SUMMARY_SYSTEM = (
     "结论；2) 未完成的事项；3) 下一步建议。不要调用任何工具。"
 )
 
-_CONTEXT_EXCEEDED_RE = re.compile(
-    r"maximum context length|context length|reduce the length|exceed.*(?:limit|length)",
-    re.IGNORECASE)
-
-
-def _is_context_exceeded(err: Any) -> bool:
-    msg = str(getattr(err, "message", None) or err)
-    return bool(_CONTEXT_EXCEEDED_RE.search(msg))
 
 
 _TOKENIZER: Any = None
@@ -88,6 +81,9 @@ def _count_tokens(msgs: List[dict]) -> Optional[int]:
             content = m.get("content") or ""
             if content:
                 total += len(_TOKENIZER.encode(str(content)))
+            reasoning = m.get("reasoning_content")
+            if reasoning:
+                total += len(_TOKENIZER.encode(str(reasoning)))
             tc = m.get("tool_calls")
             if tc:
                 total += len(_TOKENIZER.encode(json.dumps(tc, ensure_ascii=False)))
@@ -148,19 +144,25 @@ _EXEC_TOOLS: list[dict] = [
           ["code", "description"]),
     _tool("dcflow_read_doc", "读取知识库文档（filename=\"list\" 返回全部可用文档清单；文档目录: .github/docs、.github/instructions、docs）",
           {"filename": {"type": "string"}}, ["filename"]),
-    _tool("dcflow_step_done", "标记步骤完成，完成所有工作后必须调用（summary 写结论，自动挂到当前步骤）。完成声明必须结构化：携带 completion 四态——done/verified 至少一项，或显式声明 unfinished/blocked；blocked 需写明 tried 失败证据与 variants_left 未尝试变体清单（存在未尝试变体不得以受阻为由结束）",
-          {"summary": {"type": "string"},
+    _tool("dcflow_step_done", "标记步骤完成，完成所有工作后必须调用（summary 写结论，自动挂到当前步骤）。完成声明必须结构化：携带 completion 四态——done/verified 至少一项，或显式声明 unfinished/blocked；blocked 需写明 tried 失败证据与 variants_left 未尝试变体清单（存在未尝试变体不得以受阻为由结束）。unfinished 只写**本步骤职责范围内**尚未完成的事项（不属于本步骤的后续工作写进 summary 建议，不要进 unfinished）",
+          {"summary": {"type": "string",
+                       "description": "一句话结论（写进步骤报告摘要：做了什么、验证结果、落地位置）"},
            "completion": {"type": "object",
+                           "description": "完成声明四态（必填）：done/verified 至少一项；unfinished 仅本步骤职责范围内未完成的事项；受阻走 blocked",
                            "properties": {
-                               "done": {"type": "array", "items": {"type": "string"}},
-                               "verified": {"type": "array", "items": {"type": "string"}},
-                               "unfinished": {"type": "array", "items": {"type": "string"}},
+                               "done": {"type": "array", "items": {"type": "string"},
+                                        "description": "已完成项 → 落地位置（文件/产物/块名）"},
+                               "verified": {"type": "array", "items": {"type": "string"},
+                                            "description": "验证命令/测试 → 实际结果摘要（必须真跑过）"},
+                               "unfinished": {"type": "array", "items": {"type": "string"},
+                                              "description": "仅本步骤职责范围内、尚未完成的事项（系统会拒收并要求继续做完；不属于本步骤的后续工作/其他角色事项不要写进来，写进 summary 的建议即可）"},
                                "blocked": {"type": "object", "properties": {
                                    "goal": {"type": "string"},
                                    "tried": {"type": "array", "items": {"type": "string"}},
                                    "variants_left": {"type": "array", "items": {"type": "string"}},
                                    "conclusion_level": {"type": "string",
-                                                         "enum": ["implementation", "route"]}}}}}}),
+                                                         "enum": ["implementation", "route"]}}}}}},
+          ["summary", "completion"]),
 ]
 
 _REVERSE_ONLY_TOOLS = {"dcflow_sim", "dcflow_get_decompiled_code",
@@ -277,7 +279,7 @@ _MONITOR_TOOLS: list[dict] = [
           {"action": {"type": "string"},
            "step_ids": {"description": "步骤ID列表，逗号分隔字符串或字符串数组",
                         "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
-           "steps_json": {"description": "新增步骤的JSON对象数组，每个元素含 step_id/title/description/required/parallel_with/human_attention/type 等字段（human_attention=gate 可插入人工审批步骤；模型档位由系统按类型决定，无需指定）；每个元素可带 after_step_id 指定插入到该步骤之后（优先于顶层 after_step_id；不传则按顶层/默认位置）",
+           "steps_json": {"description": "新增步骤的JSON对象数组，每个元素含 step_id/title/description/required/parallel_with/human_attention/type 等字段（human_attention=gate 可插入人工审批步骤；模型档位由系统按类型决定，无需指定）；每个元素可带 after_step_id 指定插入到该步骤之后（优先于顶层 after_step_id；不传则跟随同批次上一个新步骤之后，批次首步按顶层/默认位置）",
                           "type": "array", "items": {"type": "object"}},
            "after_step_id": {"description": "新增步骤统一插入到该步骤之后（可省略；steps_json 元素内嵌的 after_step_id 优先；不传则追加末尾真实步骤之后、review 之前）",
                               "type": "string"},
@@ -339,24 +341,35 @@ _RESEARCHER_TOOLS: list[dict] = [
           ["pattern"]),
     _tool("dcflow_read_doc", "读取知识库文档（filename=\"list\" 返回全部可用文档清单；文档目录: .github/docs、.github/instructions、docs）",
           {"filename": {"type": "string"}}, ["filename"]),
-    _tool("dcflow_step_done", "标记步骤完成，完成所有工作后必须调用（summary 写结论，自动挂到当前步骤）。完成声明必须结构化：携带 completion 四态——done/verified 至少一项，或显式声明 unfinished/blocked；blocked 需写明 tried 失败证据与 variants_left 未尝试变体清单（存在未尝试变体不得以受阻为由结束）",
-          {"summary": {"type": "string"},
+    _tool("dcflow_write_file", "写入/覆盖文件（仅限调研报告等产物，必须写到自己的步骤产物目录 "
+          ".dc_tmp/<任务ID>/<步骤ID>/artifacts/ 下，推荐文件名 research-report.md；"
+          "不得修改项目/任务代码；文档一次写完整，不要分多次补写同一文件）",
+          {"file_path": {"type": "string"}, "content": {"type": "string"}},
+          ["file_path", "content"]),
+    _tool("dcflow_step_done", "标记步骤完成，完成所有工作后必须调用（summary 写结论，自动挂到当前步骤）。完成声明必须结构化：携带 completion 四态——done/verified 至少一项，或显式声明 unfinished/blocked；blocked 需写明 tried 失败证据与 variants_left 未尝试变体清单（存在未尝试变体不得以受阻为由结束）。unfinished 只写**本步骤职责范围内**尚未完成的事项（不属于本步骤的后续工作写进 summary 建议，不要进 unfinished）",
+          {"summary": {"type": "string",
+                       "description": "一句话结论（写进步骤报告摘要：做了什么、验证结果、落地位置）"},
            "completion": {"type": "object",
+                           "description": "完成声明四态（必填）：done/verified 至少一项；unfinished 仅本步骤职责范围内未完成的事项；受阻走 blocked",
                            "properties": {
-                               "done": {"type": "array", "items": {"type": "string"}},
-                               "verified": {"type": "array", "items": {"type": "string"}},
-                               "unfinished": {"type": "array", "items": {"type": "string"}},
+                               "done": {"type": "array", "items": {"type": "string"},
+                                        "description": "已完成项 → 落地位置（文件/产物/块名）"},
+                               "verified": {"type": "array", "items": {"type": "string"},
+                                            "description": "验证命令/测试 → 实际结果摘要（必须真跑过）"},
+                               "unfinished": {"type": "array", "items": {"type": "string"},
+                                              "description": "仅本步骤职责范围内、尚未完成的事项（系统会拒收并要求继续做完；不属于本步骤的后续工作/其他角色事项不要写进来，写进 summary 的建议即可）"},
                                "blocked": {"type": "object", "properties": {
                                    "goal": {"type": "string"},
                                    "tried": {"type": "array", "items": {"type": "string"}},
                                    "variants_left": {"type": "array", "items": {"type": "string"}},
                                    "conclusion_level": {"type": "string",
-                                                         "enum": ["implementation", "route"]}}}}}}),
+                                                         "enum": ["implementation", "route"]}}}}}},
+          ["summary", "completion"]),
 ]
 
 
 _TOOL_ASK_USER = _tool("dcflow_ask_user",
-      "向用户提问以澄清需求（仅需求分析师可用）：一次只问一个关键问题，"
+      "向用户提问以澄清需求（仅需求分析师/计划制定者可用）：一次只问一个关键问题，"
       "question 写清要确认什么与为什么需要确认；options 可选（给用户点选的方向）。"
       "调用后步骤暂停等待用户回答，回答会注入对话供你继续；需求已清晰时禁止调用",
       {"question": {"type": "string"},
@@ -398,6 +411,19 @@ _REQUIREMENT_TOOLS: list[dict] = [
     _TOOL_STEP_DONE_WITH_SCORE,
 ]
 
+_PLAN_TOOLS: list[dict] = [*_EXEC_TOOLS, _TOOL_ASK_USER]
+
+_TOOL_ASK_USER_SINGLE = _tool("dcflow_ask_user",
+      "向用户提问以澄清需求：一次只问一个关键问题，question 写清要确认什么与"
+      "为什么需要确认；options 可选（给用户点选的方向）。调用后等待用户回答，"
+      "回答会注入对话供你继续；需求已清晰时禁止调用",
+      {"question": {"type": "string"},
+       "options": {"type": "array", "items": {"type": "string"},
+                   "description": "可选：供用户点选的方向（不传则用户自由输入）"}},
+      ["question"])
+
+_SINGLE_CHAT_TOOLS: list[dict] = [*_EXEC_TOOLS, _TOOL_ASK_USER_SINGLE]
+
 _ARCHITECT_TOOLS: list[dict] = [
     dict(_TOOL_LIST_DIR),
     dict(_TOOL_READ_FILE),
@@ -415,6 +441,7 @@ _ARCHITECT_TOOLS: list[dict] = [
 ]
 
 _ASK_USER_ONLY = {"dcflow_ask_user"}
+_ASK_USER_TYPES = ("requirement", "plan")
 
 _REVIEW_ARRAY = {"type": "array", "items": {"type": "string"}}
 _TOOL_STEP_DONE_REVIEW = _tool("dcflow_step_done",
@@ -435,11 +462,31 @@ _TOOL_STEP_DONE_REVIEW = _tool("dcflow_step_done",
        "execution_business_logic", "execution_architecture_security",
        "execution_code_style", "execution_compile_check"])
 
+_TOOL_STEP_DONE_PLAN_REVIEW = _tool("dcflow_step_done",
+      "标记方案审查完成，审查结束后必须调用（summary 写审查结论摘要）。"
+      "必须按分类声明审查发现（每类字符串数组，无内容传空数组 []）："
+      "plan_issues = 方案必须修复的缺陷（文档结构缺失/与代码现状不符/用户旅程"
+      "未覆盖/验收不可测等——非空即系统自动打回方案设计步骤重做：清单与审查"
+      "报告转交方案设计者，无需你安排后续步骤）；plan_suggestions = 不阻塞"
+      "审批的改进建议（只随报告与 summary 转交，不触发打回）",
+      {"summary": {"type": "string"},
+       "plan_issues": {**_REVIEW_ARRAY,
+                       "description": "方案必须修复的缺陷（非空系统自动打回方案设计步骤）"},
+       "plan_suggestions": {**_REVIEW_ARRAY,
+                            "description": "不阻塞审批的改进建议（不触发打回）"}},
+      ["summary", "plan_issues", "plan_suggestions"])
+
 _CODE_REVIEW_TOOLS: list[dict] = [
     *(dict(t) for t in _EXEC_TOOLS
       if t["function"]["name"] != "dcflow_step_done"
       and t["function"]["name"] != "dcflow_edit_file"),
     _TOOL_STEP_DONE_REVIEW,
+]
+
+_PLAN_REVIEW_TOOLS: list[dict] = [
+    *(dict(t) for t in _EXEC_TOOLS
+      if t["function"]["name"] not in ("dcflow_step_done", "dcflow_edit_file")),
+    _TOOL_STEP_DONE_PLAN_REVIEW,
 ]
 
 _TEXT_TOOL_CALL_RE = re.compile(r'\{\s*"tool"\s*:\s*"(dcflow_\w+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}')
@@ -482,7 +529,7 @@ _GATE_OPTIONS_RE = re.compile(r'"options"\s*:\s*\[')
 def _gate_report_present(msgs: list[dict], round_text: str,
                          done_call: Optional[dict] = None) -> bool:
     if isinstance(done_call, dict):
-        if "[Error]" in str(done_call.get("output") or ""):
+        if done_call.get("_is_error", False):
             return False
         _in = done_call.get("input")
         ap = _in.get("approval") if isinstance(_in, dict) else None
@@ -530,6 +577,93 @@ def _tool_schema_allows_empty(name: str, tools: list[dict]) -> bool:
             params = t["function"].get("parameters") or {}
             return not params.get("properties")
     return False
+
+
+def _tool_schema_of(name: str, tools: list[dict]) -> dict:
+    for t in tools:
+        fn = t.get("function") or {}
+        if fn.get("name") == name:
+            params = fn.get("parameters")
+            return params if isinstance(params, dict) else {}
+    return {}
+
+
+def _must_pass_keys(params: dict, cap: int) -> list[str]:
+    props = params.get("properties")
+    props = props if isinstance(props, dict) else {}
+    required = params.get("required")
+    keys: list[str] = []
+    if isinstance(required, list):
+        keys = [str(k) for k in required if str(k).strip()]
+    for k in props:
+        if len(keys) >= cap:
+            break
+        if k not in keys:
+            keys.append(k)
+    return keys[:cap]
+
+
+def _placeholder_value(spec: Any) -> Any:
+    if not isinstance(spec, dict):
+        return "..."
+    t = spec.get("type")
+    if t in ("integer", "number"):
+        return 0
+    if t == "boolean":
+        return False
+    if t == "array":
+        items = spec.get("items")
+        if isinstance(items, dict) and items.get("type") == "string":
+            return ["..."]
+        return []
+    if t == "object":
+        sub = spec.get("properties")
+        if isinstance(sub, dict) and sub:
+            first = next(iter(sub))
+            return {first: _placeholder_value(sub[first])}
+        return {}
+    return "..."
+
+
+def _missing_args_feedback(name: str, tools: list[dict], raw: Any) -> str:
+    params = _tool_schema_of(name, tools)
+    props = params.get("properties")
+    props = props if isinstance(props, dict) else {}
+    required_raw = params.get("required")
+    required = ([str(k) for k in required_raw] if isinstance(required_raw, list) else [])
+    body = ("" if raw is None
+            else raw if isinstance(raw, str)
+            else json.dumps(raw, ensure_ascii=False))
+    body = body.strip()
+    shown = "（空）" if not body else (body if len(body) <= 80 else body[:80] + "…")
+    lines = [f"【系统提示】你调用的 {name} 参数为空/缺少必填参数，工具未执行。",
+             f"本次 arguments = {shown}"]
+    if props:
+        lines.append("该工具参数要求：")
+        for k, spec in list(props.items())[:8]:
+            if not isinstance(spec, dict):
+                spec = {}
+            desc = str(spec.get("description") or "").replace("\n", " ").strip()[:120]
+            mark = "必填" if (k in required or not required) else "可选"
+            lines.append(f"- {k}（{spec.get('type') or 'object'}，{mark}）"
+                         + (f"：{desc}" if desc else ""))
+    ex_keys = _must_pass_keys(params, 4)
+    example = json.dumps({k: _placeholder_value(props.get(k) or {}) for k in ex_keys},
+                         ensure_ascii=False) if ex_keys else "{}"
+    lines.append(f"正确写法示例：{name}({example})")
+    lines.append("请补齐参数后重新调用（参数写在 arguments 中，不能用对话正文替代）。")
+    return "\n".join(lines)[:1500]
+
+
+def _safe_arguments(name: str, tools: list[dict]) -> str:
+    params = _tool_schema_of(name, tools)
+    props = params.get("properties")
+    props = props if isinstance(props, dict) else {}
+    obj = {k: _placeholder_value(props.get(k) or {})
+           for k in _must_pass_keys(params, 8)}
+    if not obj:
+        obj = {"_": ""}
+    return json.dumps(obj, ensure_ascii=False)
 
 
 class _RepetitionDetector:
@@ -612,8 +746,10 @@ def _parse_text_tool_calls(text: str, task_id: str = "") -> list[dict]:
 _EMPTY_NUDGE = ("【系统提示】你上一轮未输出任何内容。"
                 "请基于已有工具结果直接输出本步骤的结论与总结（工作已完成可调用 dcflow_step_done）。")
 
-_TEXT_FINISH_NUDGE = ("【系统提示】你输出了文本但未调用完成工具（dcflow_step_done），步骤不会提交。"
-                      "若工作已完成，请调用 dcflow_step_done 提交结论；若需继续分析，请直接调用工具。")
+_SILENT_NUDGE = ("【系统提示】上一轮有输出但没有落到正文，也没有可用的工具调用，"
+                 "流程无法推进（本轮实测：completion={completion} token、"
+                 "思考 {reasoning_chars} 字）。请把结论写进正文，并调用工具推进或用 "
+                 "dcflow_step_done 提交本步骤收尾。")
 
 _KEY_FINDING_RE = re.compile(
     r"(?:关键发现|重大发现|核心发现|突破了|核心突破|关键突破|key\s*findings?)"
@@ -645,33 +781,233 @@ def _strip_trailing_kf_block(text: str) -> str:
     return _KEY_FINDINGS_BLOCK_RE.sub(r"\1", text)
 
 
+
+_FLOW_REPORT_MAX_CHARS = 17233
+_DOC_CHAR_LIMITS = {
+    _FLOW_REPORT_FILENAME: _FLOW_REPORT_MAX_CHARS,
+    _CODE_DIAGRAM_FILENAME: 8865,
+    _PROJECT_CONTEXT_FILENAME: 20262,
+}
+
+
+def _validate_code_diagram_content(content: str) -> str:
+    mermaid_blocks = re.findall(r'```(?:mermaid)?[^\n]*\n[\s\S]*?```', content)
+    if len(mermaid_blocks) > 1:
+        return (f"[Error] {_CODE_DIAGRAM_FILENAME} 只能包含一张 Mermaid 图"
+                f"（当前 {len(mermaid_blocks)} 张），请用 subgraph 在同一张图内分区")
+    outside_lines = []
+    in_fence = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and stripped and not stripped.startswith("#") \
+                and not stripped.startswith(">"):
+            outside_lines.append(stripped)
+    if outside_lines:
+        return (f"[Error] {_CODE_DIAGRAM_FILENAME} 的 Mermaid 图之外不能有描述性段落"
+                f"（发现 {len(outside_lines)} 行非标题/非引用文本），"
+                f"所有描述请放入图内节点标签或 subgraph 标题")
+    return ""
+
+
+def _doc_length_error(filename: str, content: str) -> str:
+    limit = _DOC_CHAR_LIMITS.get(filename)
+    if not limit:
+        return ""
+    text = _strip_trailing_kf_block(content) if filename == _FLOW_REPORT_FILENAME else content
+    n = len(text.rstrip())
+    if n <= limit:
+        return ""
+    return (f"{filename} 长度超限：写入后总长 {n} 字符 > 上限 {limit} 字符"
+            f"（按字符数判定）。请先蒸馏压缩（删过程叙事与重复口径，"
+            f"只留结论/读数/残余与未决）再写入。")
+
+
+def _doc_write_intent(code: str, filename: str) -> Tuple[bool, bool]:
+    if not filename or filename not in code:
+        return False, False
+    lines = code.splitlines()
+    win: set = set()
+    for i, ln in enumerate(lines):
+        if filename in ln:
+            win.update(range(i, min(i + 3, len(lines))))
+    window = "\n".join(lines[i] for i in sorted(win))
+    write_re = re.compile(
+        r"open\s*\([^)]*['\"][waxb+]{1,3}['\"]|\.write\s*\(|write_text\s*\(|"
+        r"write_bytes\s*\(|writelines\s*\(|os\.replace\s*\(|"
+        r"shutil\.(?:copyfile|copy|copy2|move)\s*\(|>>")
+    read_re = re.compile(
+        r"\.read\s*\(|read_text\s*\(|read_bytes\s*\(|readlines\s*\(|"
+        r"json\.load\s*\(|open\s*\((?![^)]*['\"][waxb+]{1,2}['\"])")
+    return bool(write_re.search(window)), bool(read_re.search(window))
+
+
+def _doc_referenced_paths(code: str, filename: str) -> List[str]:
+    out: list[str] = []
+    pat = re.compile(r"['\"]([^'\"\n]{1,200}" + re.escape(filename) + r")['\"]")
+    for m in pat.finditer(code or ""):
+        p = m.group(1)
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def _doc_abs_path(root: str, fp: str) -> str:
+    p = fp.replace("\\", "/")
+    if (not os.path.isabs(fp) and p.startswith(".dc_tmp/")) \
+            or (os.path.isabs(fp) and "/.dc_tmp/" in p):
+        return os.path.normpath(os.path.join(PROJECT_ROOT, fp))
+    return os.path.normpath(os.path.join(root, fp))
+
+
+_FLOW_SKELETON = "流程报告骨架.md"
+_DIAGRAM_SKELETON = "代码流程图骨架.md"
+_CONTEXT_SKELETON = "项目背景与约定骨架.md"
+_DOC_SKELETON_TEMPLATES = {
+    _FLOW_REPORT_FILENAME: _FLOW_SKELETON,
+    _CODE_DIAGRAM_FILENAME: _DIAGRAM_SKELETON,
+    _PROJECT_CONTEXT_FILENAME: _CONTEXT_SKELETON,
+}
+_REPORT_LEGACY_SUFFIX = "-步骤报告.md"
+_CONTEXT_SUMMARY_SECTION = "任务总结"
+_DOC_SKELETON_MAX_REJECTS = 3
+
+
+def _doc_canonical_name(filename: str) -> str:
+    if filename in _DOC_CHAR_LIMITS:
+        return filename
+    if filename.endswith(_REPORT_LEGACY_SUFFIX):
+        return _FLOW_REPORT_FILENAME
+    return ""
+
+
+def _doc_skeleton_template(filename: str) -> str:
+    return _DOC_SKELETON_TEMPLATES.get(_doc_canonical_name(filename), "")
+
+
+def _skeleton_template_path(template: str) -> str:
+    from ..prompts import templates_dir
+    return os.path.join(templates_dir(), template)
+
+
+def _doc_headers(content: str, level: int) -> List[str]:
+    out: List[str] = []
+    in_fence = False
+    for line in _strip_trailing_kf_block(content or "").splitlines():
+        s = line.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not s.startswith("#"):
+            continue
+        hashes = len(s) - len(s.lstrip("#"))
+        if hashes == level and (len(s) == hashes or s[hashes] in " \t"):
+            out.append(s[hashes:].strip())
+    return out
+
+
+def _doc_skeleton_error(filename: str, content: str, step_id: str = "") -> str:
+    template = _doc_skeleton_template(filename)
+    if not template:
+        return ""
+    path = _skeleton_template_path(template)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            want = _doc_headers(f.read(), 2)
+    except OSError:
+        logger.warning(f"[DC:orch] doc skeleton template missing: {path}")
+        return ""
+    got = _doc_headers(content, 2)
+    missing = [s for s in want if s not in got]
+    extra = [s for s in dict.fromkeys(got) if s not in want]
+    h3 = _doc_headers(content, 3) if template == _FLOW_SKELETON else []
+    if not (missing or extra or h3):
+        return ""
+    details: List[str] = []
+    if missing:
+        details.append("缺少章节 " + "、".join(f"`## {s}`" for s in missing))
+    if extra:
+        details.append("多出章节 " + "、".join(f"`## {s}`" for s in extra))
+    if h3:
+        details.append(f"不得使用 `###` 小节（发现 {len(h3)} 个，如 `### {h3[0]}`）")
+    return (f"{filename} 章节结构不符骨架：{'；'.join(details)}。骨架模板（唯一事实源）"
+            f"：{path} —— 请先用 dcflow_read_file 读它，再按骨架整篇重写，章节不多不少："
+            + "、".join(f"`## {s}`" for s in want) + "。")
+
+
+def _doc_diagram_permission_error(step_type: str, template_path: str) -> str:
+    return (f"[拒绝写入] 代码流程图只有 planner 可以修改（当前 type={step_type}）："
+            f"本步骤职责是忠实执行计划，发现图与实现不符时在流程报告中注明"
+            f"「需更新代码流程图：<具体内容>」。骨架模板：{template_path}。")
+
+
+def _doc_edit_redirect_error(filename: str, template_path: str) -> str:
+    return (f"[拒绝写入] {filename} 是骨架固定文档：dcflow_edit_file 的补丁式修改"
+            f"无法预校验章节结构，请改用 dcflow_write_file 整篇重写（先读骨架模板再写）："
+            f"{template_path}。")
+
+
+def _doc_section_body(content: str, section: str) -> str:
+    body: List[str] = []
+    inside = False
+    for line in (content or "").splitlines():
+        s = line.strip()
+        if s.startswith("## ") or s == "##":
+            if inside:
+                break
+            inside = (s[3:].strip() if s != "##" else "") == section
+            continue
+        if inside:
+            body.append(s)
+    return "\n".join(body).strip()
+
+
+def _doc_task_summary_error(step_type: str) -> str:
+    return (f"[拒绝写入] 「{_CONTEXT_SUMMARY_SECTION}」章节只有 final-reporter"
+            f"（type=report）可以在收尾时改写（当前 type={step_type}）："
+            f"其余角色请保持该章节原样，你的结论写进「开发规范」/「项目信息」/"
+            f"「经验教训」即可。")
+
+
 _LAST_PROMPT_TOKENS_ARTIFACT = "last_prompt_tokens"
 _FLOW_REPORT_ANCHOR_CHARS = 1500
 _STEP_REPORT_ROUNDS_ARTIFACT = "step_report_rounds"
 _STEP_REPORT_READ_ROUND_ARTIFACT = "step_report_read_round"
 _MONITOR_ANCHORS_ARTIFACT = "monitor_anchors"
 
-GIVE_UP_PATTERN = re.compile(
-    r"(穷尽|无法突破|无法继续|无法穿透|无法静态|无法逆推|超出.{0,6}能力|无能为力|无解|死路"
-    r"|瓶颈|做不到|走不通|行不通|诚实交付|诚实结论|标记完成|最终交付|最终确认交付"
-    r"|做最后的决定|到此为止|就此打住)"
-)
+_BG_BY_ROLE = {
+    "executor":  "这段时间踩的坑（现象/根因/规避做法）补进「经验教训」章节。",
+    "reverse":   "这段时间踩的坑（现象/根因/规避做法）补进「经验教训」章节。",
+    "plan":      "新增的开发规范/架构约定补进「开发规范」、项目事实补进「项目信息」章节。",
+    "architect": "新增的开发规范/架构约定补进「开发规范」、项目事实补进「项目信息」章节。",
+    "researcher":  "调研确认的项目事实补进「项目信息」章节。",
+    "requirement": "澄清确认的项目事实补进「项目信息」章节。",
+    "code_review": "审查发现的规范偏差补进「开发规范」章节。",
+    "plan_review": "审查发现的规范偏差补进「开发规范」章节。",
+    "gate":        "你只读，不写——发现不符处在输出里列出即可。",
+    "monitor":     "你只读，不写——发现不符处在输出里列出即可。",
+}
+
 
 
 class Orchestrator:
 
     MAX_ITERATIONS = 100
     MAX_RETRY = 10
+    EMPTY_NUDGE_MAX = 3
     CATCHUP_REPLAY_LIMIT = 500
     _ABORT_WAIT = 10.0
     _ABORT_FORCE_WAIT = 5.0
     _ZOMBIE_WAIT = 180.0
     COMPRESS_TOKENS = 400_000
+    CONTEXT_FINISH_MIN_TOKENS = COMPRESS_TOKENS
     CONTEXT_BUDGET_TOKENS = 200_000
     KEEP_RECENT_TOOL_ROUNDS = 20
-    MAX_TEXT_FINISH_NUDGE = 1
-    REPORT_NUDGE_EVERY = 50
+    REPORT_NUDGE_EVERY = 100
     STEP_DONE_AGAIN_WINDOW_S = 180.0
+    HEARTBEAT_INTERVAL_S = 15.0
 
     def __init__(self, storage: StorageAdapter, state_machine: StateMachine,
                  sse_hub: Optional[SseHub] = None,
@@ -688,6 +1024,9 @@ class Orchestrator:
         self._loop_tasks: Dict[str, asyncio.Task] = {}
         self._rewind_restarts: Dict[str, str] = {}
         self._rewind_restart_tasks: Dict[str, asyncio.Task] = {}
+        self._ask_user_answers: Dict[str, asyncio.Event] = {}
+        self._ask_user_results: Dict[str, str] = {}
+        self._queued_user_confirms: Dict[str, dict] = {}
         self._prep_cache: Dict[str, dict] = {}
         self._light_route_avoid: Optional[int] = None
         self._last_saved_round: Dict[str, int] = {}
@@ -697,9 +1036,11 @@ class Orchestrator:
         self._sim_sessions: dict = {}
         self._sim_locks: dict = {}
         self._file_write_counts: Dict[str, int] = {}
+        self._doc_skeleton_rejects: Dict[str, int] = {}
         self._round_in_flight: Dict[str, bool] = {}
         self._mid_round_user_seqs: Dict[str, list] = {}
         self._step_live: Dict[Tuple[str, str], dict] = {}
+        self._compress_requests: set = set()
 
 
     def is_running(self, task_id: str) -> bool:
@@ -712,6 +1053,8 @@ class Orchestrator:
         try:
             task = await self._storage.get_task(task_id, include_hidden=True)
             if not task:
+                return False
+            if task.get("mode") == "single":
                 return False
             if task.get("steps"):
                 return False
@@ -756,7 +1099,8 @@ class Orchestrator:
         await self._sm._resume_after_intervention(task_id)
         await self.start_task(task_id)
 
-    async def _resolve_prev_step(self, task_id: str, step_id: str) -> Optional[str]:
+    async def _resolve_prev_step(self, task_id: str, step_id: str,
+                                 skip_types: tuple = ()) -> Optional[str]:
         from ..prompts.registry import is_hidden_step
         task = await self._storage.get_task(task_id, include_hidden=True)
         cur = next((s for s in (task or {}).get("steps", [])
@@ -768,7 +1112,8 @@ class Orchestrator:
         for s in (task or {}).get("steps", []):
             order = s.get("sort_order", 0)
             if order >= cur_order or is_hidden_step(s) \
-                    or s.get("status") == "skipped":
+                    or s.get("status") == "skipped" \
+                    or s.get("type") in skip_types:
                 continue
             if prev is None or order > prev_order:
                 prev, prev_order = s.get("step_id"), order
@@ -777,7 +1122,9 @@ class Orchestrator:
     async def reject_gate_and_run(self, task_id: str, step_id: str, reason: str) -> None:
         if self._running.get(task_id, False):
             raise OrchestratorBusyError("该步骤正在审查中，请稍后再审批")
-        prev = await self._resolve_prev_step(task_id, step_id)
+        from ..prompts.registry import STEP_TYPE_PLAN_REVIEW
+        prev = await self._resolve_prev_step(task_id, step_id,
+                                             skip_types=(STEP_TYPE_PLAN_REVIEW,))
         if not prev:
             raise ValueError("前面没有可回退的步骤，无法拒绝回退")
         await self._storage.append_event(task_id, {
@@ -816,10 +1163,89 @@ class Orchestrator:
         if files:
             msg += ("\n\n## 审查报告文件（已保留，可用 dcflow_read_file 读取）\n"
                     + "\n".join(f"- {p}" for p in files))
+        zombies = await self._collect_stale_review_steps(task_id, prev, step_id)
+        if zombies:
+            await self._storage.remove_steps(task_id, zombies)
         await self._sm.reset_flow_from_step(task_id, prev)
         await self._sm.handle_step_intervention(task_id, prev, "send", msg)
         self._rewind_restarts[task_id] = step_id
-        return f"✓ 审查结论已提交（BLOCKED）——已打回到 {prev}，摘要与报告文件已转交，流程将自动重做"
+        return (f"✓ 审查结论已提交（BLOCKED）——已打回到 {prev}，摘要与报告文件已转交，"
+                f"流程将自动重做"
+                + (f"；已清理 {len(zombies)} 个被本次打回作废的待复核步骤："
+                   f"{','.join(zombies)}" if zombies else ""))
+
+    async def _resolve_prev_plan_step(self, task_id: str, step_id: str) -> Optional[str]:
+        from ..prompts.registry import is_hidden_step, STEP_TYPE_PLAN
+        task = await self._storage.get_task(task_id, include_hidden=True)
+        cur = next((s for s in (task or {}).get("steps", [])
+                    if s.get("step_id") == step_id), None)
+        if not cur:
+            return None
+        cur_order = cur.get("sort_order", 0)
+        plan, plan_order = None, None
+        for s in (task or {}).get("steps", []):
+            order = s.get("sort_order", 0)
+            if order >= cur_order or is_hidden_step(s) \
+                    or s.get("status") == "skipped" \
+                    or s.get("type") != STEP_TYPE_PLAN:
+                continue
+            if plan is None or order > plan_order:
+                plan, plan_order = s.get("step_id"), order
+        return plan or await self._resolve_prev_step(task_id, step_id)
+
+    async def rewind_plan_review(self, task_id: str, step_id: str, reason: str,
+                                 summary: str = "",
+                                 issues: Optional[list] = None,
+                                 suggestions: Optional[list] = None) -> str:
+        target = await self._resolve_prev_plan_step(task_id, step_id)
+        if not target:
+            raise ValueError("前面没有可回退的方案设计步骤，无法打回方案审查")
+        from ..prompts.registry import STEP_TYPE_PLAN_REVIEW
+        from ..step_context import get_step_temp_dir
+        artifacts_dir = os.path.join(get_step_temp_dir(task_id, step_id), "artifacts")
+        names = os.listdir(artifacts_dir) if os.path.isdir(artifacts_dir) else []
+        report_names = [n for n in names if n == "plan_review.md"] \
+            or [n for n in sorted(names)
+                if n.endswith(".md") and not n.startswith("_")]
+        files = [f".dc_tmp/{task_id}/{step_id}/artifacts/{n}" for n in report_names]
+        msg = f"【方案审查打回】{reason}"
+        if summary:
+            msg += f"\n\n## 审查结论摘要\n{summary}"
+        if issues:
+            msg += ("\n\n## 方案必须修复的缺陷（逐条）\n"
+                    + "\n".join(f"- {i}" for i in issues))
+        if suggestions:
+            msg += ("\n\n## 改进建议（不阻塞，可一并处置）\n"
+                    + "\n".join(f"- {i}" for i in suggestions))
+        if files:
+            msg += ("\n\n## 审查报告文件（已保留，可用 dcflow_read_file 读取）\n"
+                    + "\n".join(f"- {p}" for p in files))
+        zombies = await self._collect_stale_review_steps(
+            task_id, target, step_id, review_type=STEP_TYPE_PLAN_REVIEW)
+        if zombies:
+            await self._storage.remove_steps(task_id, zombies)
+        await self._sm.reset_flow_from_step(task_id, target)
+        await self._sm.handle_step_intervention(task_id, target, "send", msg)
+        self._rewind_restarts[task_id] = step_id
+        return (f"✓ 方案审查结论已提交（BLOCKED）——已打回到 {target}，"
+                f"问题清单与报告文件已转交，流程将自动重做"
+                + (f"；已清理 {len(zombies)} 个被本次打回作废的待复核步骤："
+                   f"{','.join(zombies)}" if zombies else ""))
+
+    async def _collect_stale_review_steps(self, task_id: str, prev: str,
+                                          keep_step_id: str,
+                                          review_type: str = "code_review") -> list[str]:
+        task = await self._storage.get_task(task_id, include_hidden=True)
+        steps = (task or {}).get("steps", []) or []
+        prev_order = next((s.get("sort_order", 0) for s in steps
+                           if s.get("step_id") == prev), None)
+        if prev_order is None:
+            return []
+        return [s.get("step_id") for s in steps
+                if s.get("step_id") and s.get("step_id") != keep_step_id
+                and (s.get("sort_order") or 0) > prev_order
+                and s.get("type") == review_type
+                and s.get("status") == "pending"]
 
     async def stop_task(self, task_id: str, level: str = "user") -> None:
         self._cancel_kind[task_id] = "stop"
@@ -842,6 +1268,10 @@ class Orchestrator:
         ev = self._cancel_events.get(task_id)
         if ev is not None:
             ev.set()
+        ask_evt = self._ask_user_answers.get(task_id)
+        if ask_evt is not None:
+            self._ask_user_results[task_id] = ""
+            ask_evt.set()
         try:
             from .. import rest_api
             await rest_api.kill_task_cmds(task_id)
@@ -920,6 +1350,19 @@ class Orchestrator:
         flow_msg = await self._consume_flow_intervention(task_id)
         if flow_msg:
             user_context += f"\n\n## 用户流程级请求\n{flow_msg}"
+        if step_id == "monitor-init":
+            try:
+                raw_hist = await self._storage.get_artifact(task_id, "_flow", "chat_history")
+                hist = (raw_hist or {}).get("content") or ""
+                if hist.strip():
+                    if len(hist) > 150_000:
+                        hist = (hist[:20_000] + f"\n\n…（中段截断，原文 "
+                                   f"{len(hist)} 字符，保留头部 2 万与尾部）…\n\n"
+                                   + hist[-30_000:])
+                    user_context += ("\n\n## 前身上下文（本流程由单步骤对话升级而来）\n"
+                                     + hist)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[DC:orch] chat_history inject failed for {task_id}: {e}")
         return {"system_prompt": system_prompt, "step_context": user_context,
                 "model_tier": _STEP_TYPE_MODEL_TIER.get(
                     step_type, "light"),
@@ -955,6 +1398,8 @@ class Orchestrator:
     async def _insert_monitor_step(self, task_id: str, step_id: str) -> None:
         task = await self._storage.get_task(task_id)
         if not task or task.get("status") in ("completed", "abandoned"):
+            return
+        if task.get("mode") == "single":
             return
         if self._step_is_review_kind(step_id, ""):
             return
@@ -1073,7 +1518,10 @@ class Orchestrator:
         if task:
             step_row = next((s for s in task.get("steps", [])
                              if s.get("step_id") == step_id), None)
-        if step_row and self._step_is_review_kind(step_id, step_row.get("type", "")):
+        if task and task.get("mode") == "single" and step_id == "chat":
+            prep = {"system_prompt": "", "step_context": "", "messages": [],
+                    "model_tier": "light", "step_title": "对话"}
+        elif step_row and self._step_is_review_kind(step_id, step_row.get("type", "")):
             prep = await self._monitor_prep(task_id, step_row)
         else:
             prep = await rest_api.prepare_step({"task_id": task_id, "step_id": step_id})
@@ -1345,6 +1793,7 @@ class Orchestrator:
         is_researcher = _st_type == "researcher"
         is_requirement = _st_type == "requirement"
         is_architect = _st_type == "architect"
+        is_single = bool((_t0 or {}).get("mode") == "single" and step_id == "chat")
 
         self._prep_cache.pop(f"{task_id}:{step_id}", None)
 
@@ -1381,7 +1830,7 @@ class Orchestrator:
         self._step_t0[f"{task_id}:{step_id}"] = _t_cycle
         self._step_run_accounted[f"{task_id}:{step_id}"] = _t_cycle
 
-        if not has_existing:
+        if not has_existing and not is_single:
             await self._append_message(task_id, step_id,
                                        {"role": "system", "content": system_prompt, "round_num": 0})
 
@@ -1394,9 +1843,19 @@ class Orchestrator:
 
         user_msgs = await self._read_interventions(task_id, step_id)
 
+        if is_single and not user_msgs:
+            logger.info(f"[DC:orch] single chat step={step_id} has no new user message — back to pending")
+            self._publish(task_id, "streamEnd", {"stepId": step_id})
+            self._clear_step_live(task_id, step_id)
+            await self._sm.advance_step(task_id, step_id, "pending")
+            return
+
         
-        base_msgs: list[dict] = [{"role": "system", "content": system_prompt},
-                                 {"role": "user", "content": step_context}]
+        if is_single:
+            base_msgs: list[dict] = []
+        else:
+            base_msgs = [{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": step_context}]
         if has_existing:
             compress_points = await self._get_compress_points(task_id, step_id)
             messages = base_msgs + self._sanitize_tool_pairs(
@@ -1404,6 +1863,8 @@ class Orchestrator:
         else:
             messages = base_msgs + user_msgs
 
+        if self._take_compress_request(task_id, step_id):
+            logger.info(f"[DC:orch] manual compress request consumed step={step_id}")
         last_tokens = await self._get_last_prompt_tokens(task_id, step_id)
         if has_existing:
             measured = _count_tokens(messages)
@@ -1413,7 +1874,12 @@ class Orchestrator:
                 last_tokens = measured
         compressed = await self._check_and_compress(task_id, step_id, messages, last_tokens)
         if compressed is None:
-            await self._graceful_finish_step(task_id, step_id, messages)
+            _m0 = _count_tokens(messages)
+            await self._graceful_finish_step(
+                task_id, step_id, messages,
+                evidence=f"本地判定压无可压：实测 prompt={last_tokens} 估算={_m0}"
+                         f"，已压到 {self.KEEP_RECENT_TOOL_ROUNDS} 轮底线仍 >"
+                         f" {self.COMPRESS_TOKENS}")
             if not skip_monitor:
                 await self._insert_monitor_step(task_id, step_id)
             return
@@ -1428,6 +1894,16 @@ class Orchestrator:
             mcp_tools = []
 
         try:
+            _nudge_role = ("plan" if _st_type == "plan"
+                           else "monitor" if is_review_kind
+                           else "reverse" if is_reverse
+                           else "researcher" if is_researcher
+                           else "requirement" if is_requirement
+                           else "architect" if is_architect
+                           else "gate" if is_gate
+                           else "code_review" if _st_type == "code_review"
+                           else "plan_review" if _st_type == "plan_review"
+                           else "executor")
             result = await self._call_llm(
                 task_id, step_id, model_tier, messages,
                 (self._get_monitor_tools() if is_review_kind
@@ -1435,37 +1911,32 @@ class Orchestrator:
                  else self._get_researcher_tools() if is_researcher
                  else self._get_requirement_tools() if is_requirement
                  else self._get_architect_tools() if is_architect
-                 else self._get_gate_tools() if is_gate and _st_type != "plan"
+                 else self._get_single_chat_tools() if is_single
+                 else self._get_gate_tools() if is_gate and _st_type not in ("plan", "plan_review")
                  else self._get_code_review_tools() if _st_type == "code_review"
+                 else self._get_plan_review_tools() if _st_type == "plan_review"
+                 else self._get_plan_tools() if _st_type == "plan"
                  else self._get_exec_tools()) + mcp_tools,
                 self._cancel_event(task_id),
                 empty_ok=is_review_kind,
                 text_finish=(is_gate
-                             or (is_review_kind and not step_id.startswith("monitor-"))),
+                             or (is_review_kind and not step_id.startswith("monitor-"))
+                             or is_single),
                 give_up_check=_st_type == "executor",
-                is_gate=is_gate)
+                is_gate=is_gate,
+                role=_nudge_role,
+                single_chat=is_single)
             logger.info(f"[DC:orch] done step={step_id} text={len(result.get('text', ''))}ch "
                         f"toolCalls={len(result.get('toolCalls', []))}")
             self._publish(task_id, "streamEnd", {"stepId": step_id})
             self._clear_step_live(task_id, step_id)
 
             if self._is_cancelled(task_id):
+                if is_single:
+                    if await self._step_is_active(task_id, step_id):
+                        await self._sm.advance_step(task_id, step_id, "pending")
+                    return
                 await self._sm.advance_step(task_id, step_id, "stopped")
-                return
-
-            if result.get("awaitUser"):
-                await self._sm.stop_step(task_id, step_id)
-                await self._storage.update_task(task_id, {"pause_level": "question"})
-                await self._publish_task_updated(task_id)
-                await self._append_message(
-                    task_id, step_id,
-                    {"role": "system", "round_num": -1,
-                     "content": "⏸ 已向用户提出需求确认问题，步骤暂停等待回答（回答后自动继续）"})
-                self._publish(task_id, "askUser", {"stepId": step_id})
-                self._clear_step_live(task_id, step_id)
-                self._cancelled[task_id] = True
-                logger.info(f"[DC:orch] step={step_id} awaiting user answer — "
-                            f"paused(question)")
                 return
 
             if (is_review_kind and user_msgs
@@ -1494,7 +1965,11 @@ class Orchestrator:
                 else:
                     err_msg = "AI 未输出任何结论，步骤未完成"
                     empty_msg = "❌ AI 未输出步骤结论（空响应），步骤未完成，请人工检查后重试"
-                await self._sm.advance_step(task_id, step_id, "stopped")
+                if is_single:
+                    if await self._step_is_active(task_id, step_id):
+                        await self._sm.advance_step(task_id, step_id, "pending")
+                else:
+                    await self._sm.advance_step(task_id, step_id, "stopped")
                 await self._append_message(task_id, step_id,
                                            {"role": "system", "content": empty_msg,
                                             "round_num": -1})
@@ -1561,6 +2036,18 @@ class Orchestrator:
                 await self._insert_monitor_step(task_id, step_id)
 
         except _StepGracefulFinish:
+            if is_single:
+                try:
+                    await self._sm.reset_step_for_continuation(
+                        task_id, step_id, "对话上下文已达上限")
+                    await self._append_message(task_id, step_id,
+                                               {"role": "system",
+                                                "content": "⚠️ 对话上下文已达上限，无法继续本轮对话。"
+                                                           "建议点击右上角「切换为多步骤」把对话转交流程继续。",
+                                                "round_num": -1})
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[DC:orch] single graceful finish normalize failed: {e}")
+                return
             if not skip_monitor:
                 await self._insert_monitor_step(task_id, step_id)
             return
@@ -1575,10 +2062,18 @@ class Orchestrator:
 
         except (LlmError, LlmAborted) as e:
             if self._is_cancelled(task_id):
+                if is_single:
+                    if await self._step_is_active(task_id, step_id):
+                        await self._sm.advance_step(task_id, step_id, "pending")
+                    return
                 await self._safe_mark_stopped(task_id, step_id)
                 return
 
-            await self._safe_mark_stopped(task_id, step_id)
+            if is_single:
+                if await self._step_is_active(task_id, step_id):
+                    await self._sm.advance_step(task_id, step_id, "pending")
+            else:
+                await self._safe_mark_stopped(task_id, step_id)
             err_msg = getattr(e, "message", None) or str(e)
             await self._append_message(task_id, step_id,
                                        {"role": "system", "content": f"❌ LLM Error: {err_msg}", "round_num": -1})
@@ -1602,26 +2097,36 @@ class Orchestrator:
     async def _call_llm(self, task_id: str, step_id: str, tier: str, msgs: list[dict],
                         tools: list[dict], cancel_event: asyncio.Event,
                         empty_ok: bool = False, text_finish: bool = True,
-                        give_up_check: bool = False, is_gate: bool = False) -> dict:
+                        give_up_check: bool = False, is_gate: bool = False,
+                        role: str = "", single_chat: bool = False) -> dict:
         full_content = ""
         saved_text_len = 0
         recorded_tool_calls: list[dict] = []
         rounds: list[dict] = []
         retry_count = 0
-        give_up_reminded = False
-        give_up_progress = False
         done_streak = 0
         last_done_at: Optional[float] = None
         done_struct_prompts = 0
         gate_report_nudges = 0
         done_reject_nudges = 0
+        done_completion_rejects = 0
         _round = await self._get_step_report_round(task_id, step_id)
         pending_report_nudge = False
+        _diagram_head = ("顺便对照检查一下代码流程图（" + _CODE_DIAGRAM_FILENAME +
+                         "，项目级共享）和实现是否还一致——分支条件、增删的路线。")
+        if role == "plan":
+            _diagram_block = _diagram_head + (
+                "不一致就先判断是实现错了还是图画错了：实现错了修代码，"
+                "图画错了用 dcflow_write_file 把图重写为新的蒸馏态。"
+                "它是项目代码怎么跑，不是任务步骤流程图。\n")
+        else:
+            _diagram_block = _diagram_head + (
+                "不一致的话不要改图，把偏差按「需更新代码流程图：<具体内容>」"
+                "写进你的输出或流程报告。"
+                "它是项目代码怎么跑，不是任务步骤流程图。\n")
         pending_chunks: list[dict] = []
         empty_streak = 0
-        text_nudges = 0
         done_via_tool = False
-        await_user = False
 
         if graceful.is_draining():
             raise _StepGracefulDrain(step_id)
@@ -1640,30 +2145,34 @@ class Orchestrator:
                 await self._graceful_finish_step(task_id, step_id, msgs,
                                                  reason="task_ended")
                 raise _StepGracefulFinish(step_id)
-            if pending_report_nudge:
+            if pending_report_nudge and not single_chat:
                 pending_report_nudge = False
-                report_nudge = (f"流程报告：{_FLOW_REPORT_FILENAME}（在你的临时文件夹，所有步骤共享"
-                                "同一份，不存在则用 dcflow_write_file 创建）\n"
-                                "已经跑了一段时间了，请先停下来，重新读取一次流程报告，然后合并当前尝试过的东西，碰壁的"
-                                "东西，成功的东西，有用的结论到流程报告中，不要重复内容，不要有多处工作焦点，然后各个章节深度整合一下，不要只读一部分整合，理顺思路。"
-                                "**整合完成后必须继续推进当前步骤的剩余任务（未完成的工作/验证），不要整理完报告就结束步骤**\n"
-                                f"代码流程图：{_CODE_DIAGRAM_FILENAME}（在你的临时文件夹，项目级共享——同项目路径的所有流程共用一份）"
-                                "——同时停下来检查流程图是否与当前实现一致："
-                                "每个分支的 if/else 条件是否仍成立、新增/删除的路线是否已更新。不一致时先判断是实现错了"
-                                "还是图画错了——实现错了修代码，图画错了用 dcflow_write_file/dcflow_edit_file 修正流程图"
-                                "（代码流程图是项目代码怎么跑，不是本任务的执行步骤流程图）。\n"
-                                f"项目背景与约定：{_PROJECT_CONTEXT_FILENAME}（同目录，项目级共享）——本项目新增的"
-                                "开发规范/踩坑教训，同步进对应章节。")
+                report_nudge = (
+                    f"先停一下，整理一轮再继续：重新读取一次流程报告（{_FLOW_REPORT_FILENAME}，"
+                    "在你的临时文件夹，所有步骤共享，没有就用 dcflow_write_file 建），"
+                    "把这段时间尝试过的、碰壁的、成功的以及有用的结论合并进去，"
+                    "不要重复内容、不要有多处工作焦点，各章节深度整合，不要只读一部分。"
+                    "**整合完成后必须继续推进当前步骤的剩余任务，不要整理完报告就结束步骤**\n"
+                    + _diagram_block +
+                    f"项目背景与约定（{_PROJECT_CONTEXT_FILENAME}，同目录，项目级共享）："
+                    + _BG_BY_ROLE.get(role, _BG_BY_ROLE["executor"]))
                 msgs.append({"role": "user", "content": report_nudge})
                 await self._announce_user_message(task_id, step_id, report_nudge)
                 logger.info(f"[DC:orch] report nudge after {_round} tool rounds for step={step_id}")
+            if self._take_compress_request(task_id, step_id):
+                logger.info(f"[DC:orch] manual compress request consumed step={step_id}")
             last_tokens = await self._get_last_prompt_tokens(task_id, step_id)
             compressed = await self._check_and_compress(task_id, step_id, msgs, last_tokens)
             if compressed is None:
-                await self._graceful_finish_step(task_id, step_id, msgs)
+                _m1 = _count_tokens(msgs)
+                await self._graceful_finish_step(
+                    task_id, step_id, msgs,
+                    evidence=f"本地判定压无可压（轮首）：实测 prompt={last_tokens} "
+                             f"估算={_m1}，已压到 {self.KEEP_RECENT_TOOL_ROUNDS} 轮底线仍 >"
+                             f" {self.COMPRESS_TOKENS}")
                 raise _StepGracefulFinish(step_id)
             msgs = compressed
-            await self._inject_interventions(task_id, step_id, msgs)
+            await self._inject_interventions(task_id, step_id, msgs, no_prefix=single_chat)
 
             self._round_in_flight[f"{task_id}:{step_id}"] = True
             client = self._make_llm_client(tier)
@@ -1758,6 +2267,12 @@ class Orchestrator:
                     self._cancelled[task_id] = False
                     self._cancel_kind[task_id] = None
                     continue
+                if single_chat and pending_chunks:
+                    try:
+                        await self._save_chunks(task_id, step_id, pending_chunks)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"[DC:orch] save partial chunks failed step={step_id}: {e}")
+                    pending_chunks.clear()
                 raise
             except LlmError as e:
                 logger.warning(f"[DC:orch] LLM error step={step_id} round={_round} "
@@ -1768,7 +2283,12 @@ class Orchestrator:
                         await self._update_step_stats(task_id, step_id, run_ms=_err_run)
                     except Exception as _se:  # noqa: BLE001
                         logger.warning(f"[DC:orch] step stats save failed step={step_id}: {_se}")
-                if _is_context_exceeded(e):
+                info = self._classify_error(e)
+                _measured = _count_tokens(msgs)
+                _last_tp = await self._get_last_prompt_tokens(task_id, step_id)
+                _size = max(_measured or 0, _last_tp or 0)
+                if _size >= self.CONTEXT_FINISH_MIN_TOKENS and info["code"] not in (
+                        "rate_limit", "forbidden", "server_error", "network"):
                     collected: list[str] = []
                     compressed = self._summarize_to_token_budget(
                         msgs, self.CONTEXT_BUDGET_TOKENS, self.KEEP_RECENT_TOOL_ROUNDS,
@@ -1792,9 +2312,17 @@ class Orchestrator:
                                     f"{self.KEEP_RECENT_TOOL_ROUNDS} rounds, retrying")
                         self._abort_round_live(task_id, step_id, round_uid)
                         continue
-                    await self._graceful_finish_step(task_id, step_id, msgs)
+                    logger.info(f"[DC:orch] context exceeded step={step_id} — 实测规模 "
+                                f"{_size} ≥ {self.CONTEXT_FINISH_MIN_TOKENS} 且无可压缩"
+                                f" — graceful finish")
+                    _err_text = str(getattr(e, "message", None) or e)
+                    await self._graceful_finish_step(
+                        task_id, step_id, msgs,
+                        evidence=f"实测规模={_size}（估算={_measured} / 最近 usage "
+                                 f"prompt={_last_tp}）≥ 判据 "
+                                 f"{self.CONTEXT_FINISH_MIN_TOKENS}；HTTP status="
+                                 f"{getattr(e, 'status', '?')}；服务端原文={_err_text[:200]}")
                     raise _StepGracefulFinish(step_id)
-                info = self._classify_error(e)
                 if (tier == "light"
                         and getattr(client, "_route_group", 0) in (1, 2)
                         and info["code"] in ("rate_limit", "server_error", "network")):
@@ -1891,21 +2419,107 @@ class Orchestrator:
                 bad_empty = [tc for tc in round_tool_slots
                              if _is_empty_arguments(tc.get("arguments"))
                              and not _tool_schema_allows_empty(tc["name"], tools)]
-                if bad_empty:
-                    names = ", ".join(tc["name"] for tc in bad_empty)
-                    feedback = (f"【系统提示】你调用的 {names} 参数为空/缺少必填参数，"
-                                f"工具未执行。请补齐必填参数（参考工具说明）后重新调用。")
-                    msgs.append({"role": "user", "content": feedback})
-                    await self._announce_user_message(task_id, step_id, feedback)
+                for tc in bad_empty:
+                    tc["_raw_args"] = tc.get("arguments")
+                    tc["_bad_args"] = True
+                    tc["arguments"] = _safe_arguments(tc["name"], tools)
                     logger.warning(f"[DC:orch] empty-arguments tool call step={step_id} "
-                                   f"round={_round} — skipped, feedback injected: {names}")
-                    continue
+                                   f"round={_round} — hint as tool result: {tc['name']}")
+
+                if round_tool_slots and any(tc.get("name") != "dcflow_step_done"
+                                            for tc in round_tool_slots):
+                    done_streak = 0
+
+                async def _preflight_step_done(args_obj: dict) -> Optional[str]:
+                    nonlocal done_streak, last_done_at
+                    nonlocal gate_report_nudges, done_struct_prompts
+                    nonlocal done_completion_rejects
+                    from .. import rest_api
+                    if is_gate:
+                        _ap = args_obj.get("approval")
+                        _ap_err = (rest_api._validate_approval(_ap)
+                                   if isinstance(_ap, dict) else "")
+                        if not _ap_err and _gate_report_present(
+                                msgs, round_text,
+                                {"input": args_obj, "_is_error": False}):
+                            return None
+                        if gate_report_nudges >= 2:
+                            logger.warning(f"[DC:orch] gate step {step_id} done without report "
+                                           f"after {gate_report_nudges} nudges — keeping gate wait")
+                            return None
+                        gate_report_nudges += 1
+                        logger.info(f"[DC:orch] gate report nudge for step={step_id} "
+                                    f"at round {_round} — preflight reject "
+                                    f"({gate_report_nudges}/2)")
+                        if isinstance(_ap, dict):
+                            return (
+                                "【系统提示】你的 dcflow_step_done 被系统拒收，审批请求未提交："
+                                + _ap_err
+                                + " 请修正后重新调用 dcflow_step_done 提交 approval"
+                                "（doc_path 用 dcflow_list_dir 确认真实存在的方案文档路径，"
+                                "写完整相对路径；无方案文档的 gate 传空字符串）。"
+                                "不要在对话里输出方案正文——系统直接读文档展示。")
+                        return (
+                            "【系统提示】你请求完成 gate 审批步骤，但 dcflow_step_done 未携带"
+                            "合法 approval 参数。请在 approval 中提交：options（决策选项数组，"
+                            "每项含 option/cost/risk/pros；多方案逐方案一项 + 末尾「拒绝并调整」）"
+                            "+ doc_path（方案文档相对路径，系统读取原文展示给人类审批）"
+                            "+ recommendation/questions。不要在对话里输出方案正文——系统直接"
+                            "读文档展示；若人类已在对话中拍板，则输出「✅ 已确认人类决策："
+                            "<决策内容>」后再调用 dcflow_step_done。")
+                    if not give_up_check:
+                        return None
+                    _now_mono = time.monotonic()
+                    _done_in_window = (last_done_at is not None
+                                       and _now_mono - last_done_at
+                                       <= self.STEP_DONE_AGAIN_WINDOW_S)
+                    last_done_at = _now_mono
+                    if done_streak < 1 and not _done_in_window:
+                        done_streak += 1
+                        logger.info(f"[DC:orch] done-check nudge for step={step_id} "
+                                    f"at round {_round}")
+                        return (
+                            "请先核对：步骤目标"
+                            "（任务描述/已批方案）是否已全部达成？验证命令是否都实际"
+                            "跑过且通过？结果有无可疑之处？是不是还存在尚未尝试的路径或未跑"
+                            "的验证？真的全部都做完了吗？")
+                    _comp = args_obj.get("completion")
+                    if not isinstance(_comp, dict):
+                        if done_struct_prompts >= 2:
+                            logger.warning(f"[DC:orch] step {step_id} done without structured "
+                                           f"completion after {done_struct_prompts} prompts — pass")
+                            return None
+                        done_struct_prompts += 1
+                        _sent = ("、".join(str(k) for k in args_obj)
+                                 if args_obj else "（无）")
+                        logger.info(f"[DC:orch] done-structured prompt for step={step_id} "
+                                    f"at round {_round}")
+                        return (
+                            "【系统提示】你的 dcflow_step_done 缺少必填参数 completion"
+                            f"（本次只传了：{_sent}）。完成声明必须结构化，正确写法："
+                            'dcflow_step_done({"summary": "...", "completion": '
+                            '{"done": ["已完成项→落地位置"], '
+                            '"verified": ["验证命令→实际结果"]}})。'
+                            "四态含义：done/verified 至少一项；unfinished 只写"
+                            "本步骤职责范围内未完成的事项（不属于本步骤的后续工作写进"
+                            "summary 的建议，不要进 unfinished）；受阻走 blocked"
+                            "（tried 失败证据 + variants_left 为空）。")
+                    _cerr = rest_api._validate_completion(_comp)
+                    if _cerr and done_completion_rejects < 3:
+                        done_completion_rejects += 1
+                        logger.info(f"[DC:orch] completion rejected for step={step_id} "
+                                    f"at round {_round} — preflight reject "
+                                    f"({done_completion_rejects}/3)")
+                        return f"[Error] {_cerr}"
+                    if _cerr:
+                        logger.warning(f"[DC:orch] step {step_id} completion still rejected "
+                                       f"after {done_completion_rejects} — passing through")
+                    return None
 
                 if graceful.is_draining():
                     logger.info(f"[DC:orch] graceful drain during tool execution, step={step_id}")
                     raise _StepGracefulDrain(step_id)
 
-                give_up_progress = True
                 empty_streak = 0
 
                 logger.info(f"[DC:tool] executing {len(round_tool_slots)} tool(s): "
@@ -1936,28 +2550,101 @@ class Orchestrator:
 
                 round_tcs: list[dict] = []
                 for tc in round_tool_slots:
+                    _retry = False
+                    _raw_err: Optional[bool] = None
+                    _disp_args = tc.get("_raw_args", tc["arguments"])
+                    try:
+                        input_obj = json.loads(tc["arguments"] or "{}")
+                    except (ValueError, TypeError):
+                        input_obj = {}
+                    if not isinstance(input_obj, dict):
+                        input_obj = {}
                     seq_ts = self._publish(task_id, "toolCallStart", {
                         "stepId": step_id, "callId": tc["id"], "entityId": tc["id"],
                         "toolName": tc["name"],
-                        "input": tc["arguments"]})
+                        "input": _disp_args})
                     self._upsert_step_live_tool(
                         task_id, step_id, tc["id"], name=tc["name"],
-                        input_=tc["arguments"] or "", seq=seq_ts)
+                        input_=_disp_args or "", seq=seq_ts)
                     pending_chunks.append({
                         "chunk_type": "tool_call_start", "content": tc["name"], "call_id": tc["id"]})
-                    output_text = await self._invoke_tool(task_id, step_id, tc["name"], tc["arguments"], tc["id"])
+                    if tc["name"] == "dcflow_ask_user":
+                        try:
+                            _ask_args = json.loads(tc["arguments"] or "{}")
+                        except (json.JSONDecodeError, TypeError):
+                            _ask_args = {}
+                        _ask_q = str(_ask_args.get("question") or "").strip()
+                        _ask_opts = [str(x).strip() for x in (_ask_args.get("options") or [])
+                                     if str(x).strip()][:6]
+                        await self._storage.save_artifact(
+                            task_id, step_id, "question",
+                            json.dumps({"question": _ask_q, "options": _ask_opts,
+                                        "call_id": tc["id"]}, ensure_ascii=False), "json")
+                        self._publish(task_id, "askUser", {
+                            "stepId": step_id, "callId": tc["id"],
+                            "question": _ask_q, "options": _ask_opts or None,
+                        })
+                        _ask_evt = asyncio.Event()
+                        self._ask_user_answers[task_id] = _ask_evt
+                        self._clear_step_live(task_id, step_id)
+                        try:
+                            await _ask_evt.wait()
+                        finally:
+                            self._ask_user_answers.pop(task_id, None)
+                        output_text = f"用户回答：{self._ask_user_results.pop(task_id, '')}"
+                        await self._storage.save_artifact(task_id, step_id, "question", "", "json")
+                    elif tc.get("_bad_args"):
+                        output_text = _missing_args_feedback(
+                            tc["name"], tools, tc.get("_raw_args"))
+                    elif tc["name"] == "dcflow_step_done":
+                        _syn = await _preflight_step_done(input_obj)
+                        if _syn is not None:
+                            output_text = _syn
+                            _raw_err = output_text.startswith("[Error]")
+                            _retry = True
+                        else:
+                            output_text = await self._invoke_tool(
+                                task_id, step_id, tc["name"], tc["arguments"], tc["id"])
+                            _raw_err = output_text.startswith("[Error]")
+                            if _raw_err:
+                                if is_gate and gate_report_nudges < 2:
+                                    gate_report_nudges += 1
+                                    _retry = True
+                                    output_text = (
+                                        "【系统提示】你的 dcflow_step_done 被系统拒收，"
+                                        "审批请求未提交：" + output_text[:800]
+                                        + " 请修正后重新调用 dcflow_step_done 提交 approval"
+                                        "（doc_path 用 dcflow_list_dir 确认真实存在的方案文档"
+                                        "路径，写完整相对路径；无方案文档的 gate 传空字符串）。"
+                                        "不要在对话里输出方案正文——系统直接读文档展示。")
+                                elif (not is_gate and not give_up_check
+                                        and done_reject_nudges < 2):
+                                    _retry = True
+                                    done_reject_nudges += 1
+                                    output_text = (
+                                        "【系统提示】你的 dcflow_step_done 被系统拒收，"
+                                        "步骤并未完成：" + output_text[:800]
+                                        + " 请按上述要求补齐参数后重新调用 dcflow_step_done"
+                                        "（参数不能用对话正文替代）。")
+                                elif (give_up_check
+                                        and isinstance(input_obj.get("completion"), dict)
+                                        and done_completion_rejects < 3):
+                                    _retry = True
+                                    done_completion_rejects += 1
+                    else:
+                        output_text = await self._invoke_tool(task_id, step_id, tc["name"], tc["arguments"], tc["id"])
                     if review_kind and tc["name"] == "dcflow_adjust_flow":
                         if "action=no_change" in output_text:
                             no_change_cnt += 1
                         else:
                             no_change_cnt = 0
-                    try:
-                        input_obj = json.loads(tc["arguments"] or "{}")
-                    except (ValueError, TypeError):
-                        input_obj = {}
-                    recorded_tool_calls.append({"name": tc["name"], "input": input_obj, "output": output_text})
-                    round_tcs.append({"name": tc["name"], "input": input_obj, "output": output_text,
-                                      "call_id": tc["id"]})
+                    _is_err = (_raw_err if _raw_err is not None
+                               else output_text.startswith("[Error]"))
+                    tc_rec = {"name": tc["name"], "input": input_obj, "output": output_text,
+                              "call_id": tc["id"], "_is_error": _is_err,
+                              "_retry": _retry}
+                    recorded_tool_calls.append(tc_rec)
+                    round_tcs.append(tc_rec)
                     logger.info(f"[DC:tool] {tc['name']} OK: {output_text[:80]!r}")
                     seq_res = self._publish(task_id, "toolCallResult", {
                         "stepId": step_id, "callId": tc["id"], "entityId": tc["id"],
@@ -1971,7 +2658,8 @@ class Orchestrator:
                         "chunk_type": "tool_call_result", "content": output_text, "call_id": tc["id"]})
                     msgs.append({"role": "tool", "content": output_text, "tool_call_id": tc["id"]})
 
-                rounds.append({"text": "", "toolCalls": round_tcs, "roundUid": round_uid})
+                rounds.append({"text": "", "toolCalls": round_tcs, "roundUid": round_uid,
+                               "reasoning": round_reasoning})
 
                 if self._rewind_restarts.get(task_id) == step_id:
                     pending_chunks.clear()
@@ -1992,99 +2680,20 @@ class Orchestrator:
                     done_via_tool = True
                     break
 
-                if round_tool_slots and any(tc.get("name") != "dcflow_step_done"
-                                            for tc in round_tool_slots):
-                    done_streak = 0
-
-                if any(tc.get("name") == "dcflow_ask_user" for tc in round_tool_slots):
-                    await_user = True
-                    break
-
-                if any(tc.get("name") == "dcflow_step_done" for tc in round_tool_slots):
+                _done_bad_args = any(tc.get("_bad_args")
+                                     for tc in round_tool_slots
+                                     if tc.get("name") == "dcflow_step_done")
+                if (any(tc.get("name") == "dcflow_step_done" for tc in round_tool_slots)
+                        and not _done_bad_args):
                     _done_call = next((tc for tc in round_tcs
                                        if tc.get("name") == "dcflow_step_done"), None)
-                    _done_out = str((_done_call or {}).get("output") or "").strip()
-                    if is_gate and not _gate_report_present(msgs, round_text, _done_call):
-                        if gate_report_nudges < 2:
-                            gate_report_nudges += 1
-                            if "[Error]" in _done_out:
-                                nudge = (
-                                    "【系统提示】你的 dcflow_step_done 被系统拒收，审批请求未提交："
-                                    + _done_out[:300]
-                                    + " 请修正后重新调用 dcflow_step_done 提交 approval"
-                                    "（doc_path 用 dcflow_list_dir 确认真实存在的方案文档路径，"
-                                    "写完整相对路径；无方案文档的 gate 传空字符串）。"
-                                    "不要在对话里输出方案正文——系统直接读文档展示。")
-                            else:
-                                nudge = (
-                                    "【系统提示】你请求完成 gate 审批步骤，但 dcflow_step_done 未携带"
-                                    "合法 approval 参数。请在 approval 中提交：options（决策选项数组，"
-                                    "每项含 option/cost/risk/pros；多方案逐方案一项 + 末尾「拒绝并调整」）"
-                                    "+ doc_path（方案文档相对路径，系统读取原文展示给人类审批）"
-                                    "+ recommendation/questions。不要在对话里输出方案正文——系统直接"
-                                    "读文档展示；若人类已在对话中拍板，则输出「✅ 已确认人类决策："
-                                    "<决策内容>」后再调用 dcflow_step_done。")
-                            msgs.append({"role": "user", "content": nudge})
-                            await self._announce_user_message(task_id, step_id, nudge)
-                            logger.info(f"[DC:orch] gate report nudge for step={step_id} "
-                                        f"at round {_round}")
-                            continue
-                        logger.warning(f"[DC:orch] gate step {step_id} done without report "
-                                       f"after {gate_report_nudges} nudges — keeping gate wait")
-                    if not is_gate and not give_up_check and "[Error]" in _done_out:
-                        if done_reject_nudges < 2:
-                            done_reject_nudges += 1
-                            nudge = (
-                                "【系统提示】你的 dcflow_step_done 被系统拒收，步骤并未完成："
-                                + _done_out[:300]
-                                + " 请按上述要求补齐参数后重新调用 dcflow_step_done"
-                                "（参数不能用对话正文替代）。")
-                            msgs.append({"role": "user", "content": nudge})
-                            await self._announce_user_message(task_id, step_id, nudge)
-                            logger.info(f"[DC:orch] step_done rejected for step={step_id} "
-                                        f"at round {_round} — nudge {done_reject_nudges}/2")
-                            continue
+                    if _done_call is not None and _done_call.get("_retry"):
+                        logger.info(f"[DC:orch] step_done rejected for step={step_id} "
+                                    f"at round {_round} — another round")
+                        continue
+                    if _done_call is not None and _done_call.get("_is_error"):
                         logger.warning(f"[DC:orch] step {step_id} step_done still rejected "
-                                       f"after {done_reject_nudges} nudges — passing through")
-                    if give_up_check:
-                        _now_mono = time.monotonic()
-                        _done_in_window = (last_done_at is not None
-                                           and _now_mono - last_done_at
-                                           <= self.STEP_DONE_AGAIN_WINDOW_S)
-                        last_done_at = _now_mono
-                        if done_streak < 1 and not _done_in_window:
-                            done_streak += 1
-                            done_msg = (
-                                "请先核对：步骤目标"
-                                "（任务描述/已批方案）是否已全部达成？验证命令是否都实际"
-                                "跑过且通过？结果有无可疑之处？是不是还存在尚未尝试的路径或未跑"
-                                "的验证？真的全部都做完了吗？")
-                            msgs.append({"role": "user", "content": done_msg})
-                            await self._announce_user_message(task_id, step_id, done_msg)
-                            logger.info(f"[DC:orch] done-check nudge for step={step_id} "
-                                        f"at round {_round}")
-                            continue
-                        done_call = next((tc for tc in round_tcs
-                                          if tc.get("name") == "dcflow_step_done"), None)
-                        completion_ok = (done_call is not None
-                                         and isinstance(done_call.get("input"), dict)
-                                         and isinstance(done_call["input"].get("completion"), dict)
-                                         and "[Error]" not in str(done_call.get("output") or ""))
-                        if not completion_ok:
-                            if done_struct_prompts < 2:
-                                done_struct_prompts += 1
-                                done_msg = (
-                                    "【系统提示】完成声明必须结构化：请在 dcflow_step_done 参数中"
-                                    "携带 completion 对象（done/verified 至少一项，或显式声明"
-                                    " unfinished/blocked；blocked 需写明 tried 失败证据与"
-                                    " variants_left——存在未尝试变体不得以受阻为由结束）。")
-                                msgs.append({"role": "user", "content": done_msg})
-                                await self._announce_user_message(task_id, step_id, done_msg)
-                                logger.info(f"[DC:orch] done-structured prompt for step={step_id} "
-                                            f"at round {_round}")
-                                continue
-                            logger.warning(f"[DC:orch] step {step_id} done without structured "
-                                           f"completion after {done_struct_prompts} prompts — pass")
+                                       f"after nudges — passing through")
                     done_via_tool = True
                     logger.info(f"[DC:orch] dcflow_step_done called for step={step_id} — "
                                 f"completing step")
@@ -2092,15 +2701,22 @@ class Orchestrator:
 
                 compressed = await self._check_and_compress(task_id, step_id, msgs, round_usage["prompt"])
                 if compressed is None:
-                    await self._graceful_finish_step(task_id, step_id, msgs)
+                    _m2 = _count_tokens(msgs)
+                    await self._graceful_finish_step(
+                        task_id, step_id, msgs,
+                        evidence=f"本地判定压无可压（轮末）：本轮 usage prompt="
+                                 f"{round_usage['prompt']} 估算={_m2}，已压到 "
+                                 f"{self.KEEP_RECENT_TOOL_ROUNDS} 轮底线仍 >"
+                                 f" {self.COMPRESS_TOKENS}")
                     raise _StepGracefulFinish(step_id)
                 if compressed is not msgs:
                     msgs[:] = compressed
                     logger.info(f"[DC:ai] compressed to {len(msgs)} messages after round {_round}")
                 continue
 
-            if round_text.strip():
-                rounds.append({"text": round_text, "toolCalls": [], "roundUid": round_uid})
+            if round_text.strip() or round_reasoning.strip():
+                rounds.append({"text": round_text, "toolCalls": [], "roundUid": round_uid,
+                               "reasoning": round_reasoning})
                 if self._rewind_restarts.get(task_id) != step_id:
                     await self._append_round_messages(task_id, step_id, rounds)
                     await self._save_chunks(task_id, step_id, pending_chunks)
@@ -2111,40 +2727,31 @@ class Orchestrator:
             if round_text.strip() or round_reasoning.strip():
                 await self._capture_key_findings(task_id, step_id,
                                                  round_text + "\n" + round_reasoning)
-            if give_up_check and round_text.strip() and GIVE_UP_PATTERN.search(round_text) and (
-                    not give_up_reminded or give_up_progress):
-                give_up_reminded = True
-                give_up_progress = False
-                give_up_msg = (f"任务还没完成，先别急着收尾。请重新读一遍当前步骤报告"
-                               f"（{_FLOW_REPORT_FILENAME}，在你的临时文件夹）和最近的关键发现，"
-                               f"认真研究里面的线索和未验证的假设，找出新的突破口再继续。"
-                               f"你之前几次说\"穷尽\"之后换个角度都还有新发现，我不在线，"
-                               f"你继续独立完成我指定的目标，直到所有目标都完成。")
-                msgs.append({"role": "user", "content": give_up_msg})
-                await self._announce_user_message(task_id, step_id, give_up_msg)
-                logger.info(f"[DC:orch] give-up nudge for step={step_id} at round {_round}")
-            elif round_text.strip():
-                give_up_progress = True
             if not round_text.strip():
                 empty_streak += 1
                 if empty_ok:
                     break
-                if empty_streak <= 3:
-                    msgs.append({"role": "user", "content": _EMPTY_NUDGE})
-                    await self._announce_user_message(task_id, step_id, _EMPTY_NUDGE)
+                _spoke = first_chunk_t is not None
+                _comp = round_usage["completion"]
+                if empty_streak <= self.EMPTY_NUDGE_MAX:
+                    _nudge = (_EMPTY_NUDGE
+                              if not (_spoke or _comp or round_reasoning.strip())
+                              else _SILENT_NUDGE.format(
+                                  completion=_comp,
+                                  reasoning_chars=len(round_reasoning)))
+                    msgs.append({"role": "user", "content": _nudge})
+                    await self._announce_user_message(task_id, step_id, _nudge,
+                                                      round_num=len(rounds))
                     logger.warning(f"[DC:orch] empty response for step={step_id} — "
-                                   f"auto retry {empty_streak}/3 with nudge")
+                                   f"auto retry {empty_streak}/{self.EMPTY_NUDGE_MAX} "
+                                   f"spoke={_spoke} completion={_comp} "
+                                   f"reasoning_chars={len(round_reasoning)} "
+                                   f"text_chars={len(round_text)}")
                     continue
                 break
             empty_streak = 0
             if text_finish:
                 break
-            if text_nudges < self.MAX_TEXT_FINISH_NUDGE:
-                text_nudges += 1
-                msgs.append({"role": "user", "content": _TEXT_FINISH_NUDGE})
-                await self._announce_user_message(task_id, step_id, _TEXT_FINISH_NUDGE)
-                logger.info(f"[DC:orch] text without step_done for step={step_id} — "
-                            f"confirm nudge {text_nudges}/{self.MAX_TEXT_FINISH_NUDGE}")
             continue
 
         if self._rewind_restarts.get(task_id) == step_id:
@@ -2152,10 +2759,12 @@ class Orchestrator:
         else:
             tail = full_content[saved_text_len:]
             if tail.strip():
-                rounds.append({"text": tail, "toolCalls": [], "roundUid": round_uid})
+                rounds.append({"text": tail, "toolCalls": [], "roundUid": round_uid,
+                               "reasoning": round_reasoning})
                 await self._append_message(task_id, step_id,
                                            {"role": "assistant", "content": tail,
-                                            "round_num": len(rounds) - 1},
+                                            "round_num": len(rounds) - 1,
+                                            "reasoning": round_reasoning},
                                            entity_id=round_uid)
             await self._save_chunks(task_id, step_id, pending_chunks)
             pending_chunks.clear()
@@ -2168,7 +2777,7 @@ class Orchestrator:
         else:
             empty = not bool(full_content.strip()) and not empty_ok and not done_via_tool
         return {"text": full_content, "toolCalls": recorded_tool_calls,
-                "rounds": rounds, "empty": empty, "awaitUser": await_user}
+                "rounds": rounds, "empty": empty}
 
     async def _save_intervention_message(self, task_id: str, step_id: str, message: str) -> None:
         try:
@@ -2218,7 +2827,8 @@ class Orchestrator:
                 return True
         return False
 
-    async def _inject_interventions(self, task_id: str, step_id: str, msgs: list[dict]) -> None:
+    async def _inject_interventions(self, task_id: str, step_id: str, msgs: list[dict],
+                                    no_prefix: bool = False) -> None:
         try:
             raw = await self._storage.get_artifact(task_id, step_id, "intervention")
             if not raw or not raw.get("content"):
@@ -2232,24 +2842,35 @@ class Orchestrator:
                 return
 
             remaining: list[dict] = []
+            delivered: list[dict] = []
             for iv in iv_list:
                 itype = iv.get("type", "") if isinstance(iv, dict) else ""
                 msg = iv.get("message", "") if isinstance(iv, dict) else ""
                 if itype in ("pre_tool_injection", "force_inject") and msg:
-                    msgs.append({"role": "user", "content": "[用户介入]: " + msg})
+                    msgs.append({"role": "user",
+                                 "content": msg if no_prefix else "[用户介入]: " + msg})
                     if not iv.get("persisted"):
                         await self._announce_user_message(task_id, step_id, msg)
+                    item = self._take_queued_user_confirm(
+                        task_id, step_id, iv.get("client_msg_id") if isinstance(iv, dict) else None,
+                        msg)
+                    if item:
+                        delivered.append(item)
                     logger.info(f"[DC:orch] injected intervention [{itype}]: {msg[:50]}")
                 else:
                     remaining.append(iv)
 
             await self._storage.save_artifact(task_id, step_id, "intervention",
                                               json.dumps(remaining, ensure_ascii=False), "json")
+            if delivered:
+                self._publish(task_id, "messagesConfirmed",
+                              {"stepId": step_id, "items": delivered})
         except Exception:
             pass
 
     async def _read_interventions(self, task_id: str, step_id: str) -> list[dict]:
         user_msgs: list[dict] = []
+        delivered: list[dict] = []
         try:
             raw = await self._storage.get_artifact(task_id, step_id, "intervention")
             if raw and raw.get("content"):
@@ -2261,10 +2882,17 @@ class Orchestrator:
                         user_msgs.append({"role": "user", "content": msg})
                         if not iv.get("persisted"):
                             await self._announce_user_message(task_id, step_id, msg)
+                        item = self._take_queued_user_confirm(
+                            task_id, step_id, iv.get("client_msg_id"), msg)
+                        if item:
+                            delivered.append(item)
                 if user_msgs:
                     await self._storage.save_artifact(task_id, step_id, "intervention", "[]", "json")
         except Exception:
             pass
+        if delivered:
+            self._publish(task_id, "messagesConfirmed",
+                          {"stepId": step_id, "items": delivered})
         return user_msgs
 
 
@@ -2330,7 +2958,7 @@ class Orchestrator:
                     except (ValueError, TypeError):
                         calls = []
                 entry: dict = {"role": "assistant", "content": content}
-                entry["reasoning_content"] = ""
+                entry["reasoning_content"] = str(m.get("reasoning") or "")
                 calls = [c for c in calls
                          if not _is_empty_arguments(
                              (c.get("function") or {}).get("arguments", ""))]
@@ -2343,6 +2971,9 @@ class Orchestrator:
                                       "arguments": json.dumps(pc["input"], ensure_ascii=False)}}
                         for pc in parsed_calls
                     ]
+                if not entry["content"] and not entry.get("tool_calls") \
+                        and entry["reasoning_content"]:
+                    entry["content"] = " "
                 out.append(entry)
             elif role == "tool":
                 if skip_tool_tail:
@@ -2388,6 +3019,7 @@ class Orchestrator:
             total = 0
             for m in msgs:
                 total += len(m.get("content", "") or "")
+                total += len(str(m.get("reasoning_content") or ""))
                 tc = m.get("tool_calls")
                 if tc:
                     total += len(json.dumps(tc, ensure_ascii=False))
@@ -2411,6 +3043,7 @@ class Orchestrator:
                         args_obj = {}
                     summaries.append(self._summarize_tool_call(name, args_obj))
                 removed = len(out[start].get("content", "") or "") + len(
+                    str(out[start].get("reasoning_content") or "")) + len(
                     json.dumps(out[start].get("tool_calls") or [], ensure_ascii=False))
                 end = start + 1
                 while end < len(out) and out[end].get("role") == "tool":
@@ -2634,6 +3267,46 @@ class Orchestrator:
                     f"tokens {total} msgs {len(msgs)} -> {len(msgs2)}")
         return self._sanitize_tool_pairs(msgs2)
 
+    def _take_compress_request(self, task_id: str, step_id: str) -> bool:
+        key = f"{task_id}:{step_id}"
+        if key in self._compress_requests:
+            self._compress_requests.discard(key)
+            return True
+        return False
+
+    async def manual_compress_check(self, task_id: str, step_id: str) -> dict:
+        key = f"{task_id}:{step_id}"
+        if self._running.get(task_id) and await self._step_is_active(task_id, step_id):
+            self._compress_requests.add(key)
+            logger.info(f"[DC:orch] manual compress queued step={step_id}")
+            return {"status": "queued"}
+        self._compress_requests.discard(key)
+        existing_messages = await self._storage.get_step_messages(task_id, step_id)
+        if not existing_messages:
+            return {"status": "skipped", "reason": "no_messages"}
+        prep = await self.get_step_prep(task_id, step_id)
+        before_points = await self._get_compress_points(task_id, step_id)
+        msgs: list[dict] = [
+            {"role": "system", "content": prep.get("system_prompt", "") or ""},
+            {"role": "user", "content": prep.get("step_context", "") or ""},
+        ] + self._sanitize_tool_pairs(
+            self._build_lm_messages(existing_messages, before_points))
+        last_tokens = await self._get_last_prompt_tokens(task_id, step_id)
+        tokens_before = last_tokens if last_tokens is not None else _count_tokens(msgs)
+        compressed = await self._check_and_compress(task_id, step_id, msgs, last_tokens)
+        if compressed is None:
+            logger.info(f"[DC:orch] manual compress step={step_id} exhausted")
+            return {"status": "exhausted", "tokens_before": tokens_before}
+        if compressed is msgs:
+            logger.info(f"[DC:orch] manual compress step={step_id} skipped (within budget)")
+            return {"status": "skipped", "reason": "within_budget",
+                    "tokens_before": tokens_before}
+        after_points = await self._get_compress_points(task_id, step_id)
+        logger.info(f"[DC:orch] manual compress step={step_id} ok "
+                    f"points {len(before_points)} -> {len(after_points)}")
+        return {"status": "ok", "rounds": max(0, len(after_points) - len(before_points)),
+                "tokens_before": tokens_before, "tokens_after": _count_tokens(compressed)}
+
     async def _get_compress_points(self, task_id: str, step_id: str) -> list[str]:
         try:
             raw = await self._storage.get_artifact(task_id, "_flow", _COMPRESS_MAP_ARTIFACT)
@@ -2687,10 +3360,14 @@ class Orchestrator:
 
     async def _graceful_finish_step(self, task_id: str, step_id: str,
                                     msgs: list[dict],
-                                    reason: str = "context_limit") -> None:
+                                    reason: str = "context_limit",
+                                    evidence: str = "") -> None:
         finish_label = ("[任务已完成，步骤收尾]" if reason == "task_ended"
                         else "[上下文超限，步骤已收尾]")
+        if evidence:
+            finish_label = f"{finish_label}（依据：{evidence}）"
         summary = ""
+        degraded = False
         try:
             client = self._make_llm_client("power")
             user_content = self._build_progress_input(msgs)
@@ -2708,19 +3385,25 @@ class Orchestrator:
             for m in reversed(msgs):
                 if m.get("role") == "assistant" and not m.get("tool_calls") \
                         and (m.get("content") or "").strip():
-                    summary = m["content"].strip()[:500]
+                    summary = ("（收尾总结未生成，以下为该步骤最后一条进展文本）"
+                               + m["content"].strip()[:500])
+                    degraded = True
                     break
         if summary:
+            if not degraded:
+                try:
+                    raw = await self._storage.get_artifact(task_id, "_flow",
+                                                           _KEY_FINDING_ARTIFACT)
+                    existing: list[str] = []
+                    if raw and raw.get("content"):
+                        existing = [ln for ln in str(raw["content"]).splitlines() if ln.strip()]
+                    merged = existing + [f"[步骤 {step_id} 进度总结] {summary}"]
+                    merged = merged[-_KEY_FINDING_MAX_LINES:]
+                    await self._storage.save_artifact(task_id, "_flow", _KEY_FINDING_ARTIFACT,
+                                                      "\n".join(merged), "text")
+                except Exception:
+                    pass
             try:
-                raw = await self._storage.get_artifact(task_id, "_flow", _KEY_FINDING_ARTIFACT)
-                existing: list[str] = []
-                if raw and raw.get("content"):
-                    existing = [ln for ln in str(raw["content"]).splitlines() if ln.strip()]
-                merged = existing + [f"[步骤 {step_id} 进度总结] {summary}"]
-                merged = merged[-_KEY_FINDING_MAX_LINES:]
-                content = "\n".join(merged)
-                await self._storage.save_artifact(task_id, "_flow", _KEY_FINDING_ARTIFACT,
-                                                  content, "text")
                 await self._append_message(task_id, step_id,
                                            {"role": "assistant",
                                             "content": f"{finish_label} {summary}",
@@ -2728,6 +3411,13 @@ class Orchestrator:
             except Exception:
                 pass
         await self._sm.advance_step(task_id, step_id, "completed")
+        try:
+            if not step_id.startswith("monitor-"):
+                await self._storage.export_step_conversation(
+                    task_id, step_id, get_step_temp_dir(task_id, step_id))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DC:orch] export step conversation failed "
+                           f"task={task_id} step={step_id}: {e}")
         if step_id == "report":
             await self._sm.complete_task(task_id)
         self._publish(task_id, "streamEnd", {"stepId": step_id})
@@ -2788,8 +3478,7 @@ class Orchestrator:
                     if remain:
                         out.append({**m, "tool_calls": remain})
                     elif m.get("content"):
-                        out.append({k: v for k, v in m.items()
-                                    if k not in ("tool_calls", "reasoning_content")})
+                        out.append({k: v for k, v in m.items() if k != "tool_calls"})
                 else:
                     out.append(m)
             elif role == "tool":
@@ -2823,6 +3512,12 @@ class Orchestrator:
     def _get_exec_tools(self) -> list[dict]:
         return list(_EXEC_TOOLS)
 
+    def _get_plan_tools(self) -> list[dict]:
+        return list(_PLAN_TOOLS)
+
+    def _get_single_chat_tools(self) -> list[dict]:
+        return list(_SINGLE_CHAT_TOOLS)
+
     def _get_monitor_tools(self) -> list[dict]:
         return list(_MONITOR_TOOLS)
 
@@ -2843,6 +3538,9 @@ class Orchestrator:
 
     def _get_code_review_tools(self) -> list[dict]:
         return list(_CODE_REVIEW_TOOLS)
+
+    def _get_plan_review_tools(self) -> list[dict]:
+        return list(_PLAN_REVIEW_TOOLS)
 
     def _make_llm_client(self, tier: str):
         from ..config import get_llm_config
@@ -2902,32 +3600,25 @@ class Orchestrator:
             except Exception as e:  # noqa: BLE001
                 return f"[Error] MCP 工具调用异常: {str(e)[:300]}"
         if name in _REVERSE_ONLY_TOOLS:
-            _step_type = "executor"
-            try:
-                _trow = await self._storage.get_task(task_id, include_hidden=True)
-                _st = next((s for s in (_trow or {}).get("steps", [])
-                            if s.get("step_id") == step_id), None)
-                if _st:
-                    _step_type = _st.get("type") or "executor"
-            except Exception:  # noqa: BLE001
-                pass
+            _step_type = await self._step_type_of(task_id, step_id)
             if _step_type != "reverse":
                 return f"[Error] 工具 {name} 仅逆向专家步骤（type=reverse）可用"
         if name in _ASK_USER_ONLY:
-            _ask_type = "executor"
-            try:
-                _trow2 = await self._storage.get_task(task_id, include_hidden=True)
-                _st2 = next((s for s in (_trow2 or {}).get("steps", [])
-                             if s.get("step_id") == step_id), None)
-                if _st2:
-                    _ask_type = _st2.get("type") or "executor"
-            except Exception:  # noqa: BLE001
-                pass
-            if _ask_type != "requirement":
-                logger.warning(f"[DC:orch] ask_user 越权拒绝 step={step_id} "
-                               f"type={_ask_type}")
-                return ("[Error] dcflow_ask_user 仅需求分析师（type=requirement）可用，"
-                        "本步骤类型无权向用户提问")
+            _ask_type = await self._step_type_of(task_id, step_id)
+            if _ask_type not in _ASK_USER_TYPES:
+                _ask_single_ok = False
+                try:
+                    _ask_task = await self._storage.get_task(task_id)
+                    _ask_single_ok = bool(_ask_task
+                                          and _ask_task.get("mode") == "single"
+                                          and step_id == "chat")
+                except Exception:  # noqa: BLE001
+                    _ask_single_ok = False
+                if not _ask_single_ok:
+                    logger.warning(f"[DC:orch] ask_user 越权拒绝 step={step_id} "
+                                   f"type={_ask_type}")
+                    return ("[Error] dcflow_ask_user 仅需求分析师（type=requirement）"
+                            "与计划制定者（type=plan）可用，本步骤类型无权向用户提问")
         try:
             args = json.loads(arguments_str or "{}")
             if not isinstance(args, dict):
@@ -2943,11 +3634,44 @@ class Orchestrator:
                         "会落到项目根而非步骤目录，后续步骤读不到）：请传完整路径 —— 推荐 "
                         f".dc_tmp/{task_id}/{step_id}/artifacts/<文件名>（产物目录）；"
                         "或绝对路径。产物统一放步骤产物目录 artifacts/ 下。")
+        if name in _FILE_WRITE_TOOLS:
+            _wtype = await self._step_type_of(task_id, step_id)
+            if _wtype == "researcher":
+                if name == "dcflow_edit_file":
+                    return "[Error] 调研员不支持 dcflow_edit_file：报告请用 dcflow_write_file 一次写完整，落点限自己的步骤产物目录"
+                fp = str(args.get("file_path") or "")
+                _base = os.path.normcase(os.path.abspath(
+                    get_step_temp_dir(task_id, step_id)))
+                _cand = os.path.normcase(os.path.abspath(
+                    fp if os.path.isabs(fp) else os.path.join(PROJECT_ROOT, fp)))
+                if not _cand.startswith(_base + os.sep):
+                    return ("[Error] 调研员只能写自己的步骤产物目录："
+                            f".dc_tmp/{task_id}/{step_id}/artifacts/<文件名>（推荐 "
+                            "research-report.md）；不得修改项目/任务代码或其他目录")
+        if name in _FILE_WRITE_TOOLS:
+            _pre_err = await self._doc_write_precheck(task_id, step_id, name, args)
+            if _pre_err:
+                logger.info(f"[DC:orch] doc write precheck blocked step={step_id} "
+                            f"file={os.path.basename(str(args.get('file_path') or ''))}")
+                return _pre_err
         action, block_msg = await self._intercept_step_report(task_id, step_id, name, args)
         if action == "block":
             logger.info(f"[DC:orch] flow report write blocked step={step_id}: {block_msg[:60]}")
             return block_msg
         asset_action, asset_file = await self._intercept_project_asset(task_id, step_id, name, args)
+        if name in _FILE_WRITE_TOOLS:
+            _skel_err = await self._doc_skeleton_precheck(task_id, step_id, name, args)
+            if _skel_err:
+                logger.info(f"[DC:orch] doc skeleton blocked step={step_id} "
+                            f"file={os.path.basename(str(args.get('file_path') or ''))}")
+                return _skel_err
+        _rc_plan: Optional[dict] = None
+        if name == "dcflow_run_code":
+            _rc_plan = await self._before_run_code_docs(
+                task_id, step_id, str(args.get("code") or ""))
+            if _rc_plan.get("block"):
+                logger.info(f"[DC:orch] run_code doc blocked step={step_id}")
+                return _rc_plan["block"]
         if name == "dcflow_sim":
             from ..simulator.tool import run_sim_tool
             lock = self._sim_locks.setdefault(task_id, asyncio.Lock())
@@ -2982,6 +3706,12 @@ class Orchestrator:
             await self._mirror_step_report(task_id, step_id)
         if asset_action == "mirror":
             await self._mirror_project_asset(task_id, step_id, asset_file)
+        if _rc_plan is not None:
+            _rc_note = await self._after_run_code_docs(task_id, step_id, _rc_plan)
+            if _rc_note:
+                _prev = (str(result.get("result", "")) if isinstance(result, dict)
+                         else str(result))
+                result = {"result": _rc_note + (f"\n\n{_prev}" if _prev else "")}
         text = (str(result.get("result", "(无输出)")) if isinstance(result, dict)
                 else str(result))
         return self._file_write_nudge(task_id, step_id, name, args, text)
@@ -3050,15 +3780,19 @@ class Orchestrator:
             logger.warning(f"[DC:orch] project asset pull failed step={step_id} "
                            f"file={filename}: {e}")
 
-    async def _mirror_project_asset(self, task_id: str, step_id: str, filename: str) -> None:
+    async def _mirror_project_asset(self, task_id: str, step_id: str, filename: str,
+                                   source_path: str = "") -> None:
         try:
             asset_type = _PROJECT_ASSET_FILES.get(filename)
             if not asset_type:
                 return
-            fp = _project_asset_local_path(task_id, asset_type, filename)
+            canon = _project_asset_local_path(task_id, asset_type, filename)
+            fp = source_path or canon
             content = _read_asset_file(fp)
             if not content:
                 return
+            if os.path.normpath(fp) != os.path.normpath(canon):
+                _write_asset_file(canon, content)
             key = await get_project_key(self._storage, task_id)
             await self._storage.save_project_asset(
                 key, asset_type, content, "text",
@@ -3099,6 +3833,22 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[DC:orch] project asset broadcast failed type={asset_type}: {e}")
 
+    async def _restore_flow_report_file(self, task_id: str, report_path: str = "") -> None:
+        path = report_path or os.path.join(PROJECT_ROOT, ".dc_tmp", task_id,
+                                          _FLOW_REPORT_FILENAME)
+        try:
+            if os.path.isfile(path):
+                return
+            raw = await self._storage.get_artifact(task_id, "_flow", _STEP_REPORT_ARTIFACT)
+            if raw and raw.get("content"):
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(raw["content"])
+                logger.info(f"[DC:orch] flow report restored from DB ({len(raw['content'])} "
+                            f"chars) → {path}")
+        except OSError as e:
+            logger.warning(f"[DC:orch] flow report restore failed task={task_id}: {e}")
+
     async def _intercept_step_report(self, task_id: str, step_id: str, name: str,
                                      args: dict) -> tuple[str, str]:
         fp = str(args.get("file_path") or "")
@@ -3109,14 +3859,7 @@ class Orchestrator:
             return "", ""
         if name == "dcflow_read_file":
             report_path = os.path.normpath(os.path.join(PROJECT_ROOT, fp))
-            if not os.path.isfile(report_path):
-                raw = await self._storage.get_artifact(task_id, "_flow", _STEP_REPORT_ARTIFACT)
-                if raw and raw.get("content"):
-                    os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
-                    with open(report_path, "w", encoding="utf-8") as f:
-                        f.write(raw["content"])
-                    logger.info(f"[DC:orch] flow report restored from DB before read "
-                                f"step={step_id} ({len(raw['content'])} chars)")
+            await self._restore_flow_report_file(task_id, report_path)
             try:
                 await self._save_step_report_read_round(
                     task_id, step_id, await self._get_step_report_round(task_id, step_id))
@@ -3136,19 +3879,21 @@ class Orchestrator:
             return "mirror", ""
         return "", ""
 
-    async def _mirror_step_report(self, task_id: str, step_id: str) -> None:
+    async def _mirror_step_report(self, task_id: str, step_id: str,
+                                 source_path: str = "") -> None:
         try:
-            report_path = os.path.join(PROJECT_ROOT, ".dc_tmp", task_id,
-                                       _FLOW_REPORT_FILENAME)
-            legacy_path = os.path.join(PROJECT_ROOT, ".dc_tmp", task_id, step_id,
-                                       f"{step_id}-步骤报告.md")
-            if os.path.isfile(report_path) and os.path.isfile(legacy_path):
-                if os.path.getmtime(legacy_path) >= os.path.getmtime(report_path):
+            report_path = source_path or os.path.join(PROJECT_ROOT, ".dc_tmp", task_id,
+                                                      _FLOW_REPORT_FILENAME)
+            if not source_path:
+                legacy_path = os.path.join(PROJECT_ROOT, ".dc_tmp", task_id, step_id,
+                                           f"{step_id}-步骤报告.md")
+                if os.path.isfile(report_path) and os.path.isfile(legacy_path):
+                    if os.path.getmtime(legacy_path) >= os.path.getmtime(report_path):
+                        report_path = legacy_path
+                elif os.path.isfile(legacy_path):
                     report_path = legacy_path
-            elif os.path.isfile(legacy_path):
-                report_path = legacy_path
-            elif not os.path.isfile(report_path):
-                return
+                elif not os.path.isfile(report_path):
+                    return
             with open(report_path, "r", encoding="utf-8") as f:
                 content = f.read()
             file_content = content
@@ -3179,12 +3924,289 @@ class Orchestrator:
             logger.warning(f"[DC:orch] flow report mirror failed step={step_id}: {e}")
 
 
+    async def _doc_write_precheck(self, task_id: str, step_id: str, name: str,
+                                  args: dict) -> Optional[str]:
+        fp = str((args or {}).get("file_path") or "")
+        if not fp or name not in _FILE_WRITE_TOOLS:
+            return None
+        filename = _doc_canonical_name(os.path.basename(fp.replace("\\", "/")))
+        if not filename:
+            return None
+        if name == "dcflow_write_file":
+            content = str((args or {}).get("content") or "")
+        else:
+            from ..step_context import get_task_workspace
+            root = await get_task_workspace(self._storage, task_id)
+            target = _doc_abs_path(root, fp)
+            if not os.path.isfile(target):
+                return None
+            try:
+                with open(target, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except (OSError, UnicodeDecodeError):
+                return None
+            from .. import rest_api
+            replaced, _note = rest_api.apply_edit_text(
+                text, str((args or {}).get("old_string") or ""),
+                str((args or {}).get("new_string") or ""),
+                bool((args or {}).get("replace_all")),
+                (args or {}).get("occurrence"))
+            if replaced is None:
+                return None
+            content = replaced
+        reason = ""
+        if filename == _CODE_DIAGRAM_FILENAME:
+            reason = _validate_code_diagram_content(content)
+        if not reason:
+            reason = _doc_length_error(filename, content)
+            if reason:
+                reason = "[Error] " + reason
+        if not reason:
+            return None
+        return f"{reason}（写入前拦截：本次 {name} 未执行，文件未改动）"
+
+    async def _step_type_of(self, task_id: str, step_id: str) -> str:
+        try:
+            task = await self._storage.get_task(task_id, include_hidden=True)
+            step = self._find_step(task, step_id)
+            if step:
+                return step.get("type") or "executor"
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DC:orch] step type lookup failed step={step_id}: {e}")
+        return "executor"
+
+    async def _current_project_context(self, task_id: str, fp: str) -> str:
+        try:
+            from ..step_context import get_task_workspace
+            root = await get_task_workspace(self._storage, task_id)
+            local = _read_asset_file(_doc_abs_path(root, fp))
+            if local:
+                return local
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DC:orch] project context local read failed: {e}")
+        try:
+            asset = await self._load_project_asset(
+                task_id, _PROJECT_ASSET_FILES[_PROJECT_CONTEXT_FILENAME])
+            if asset:
+                return str(asset.get("content") or "")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DC:orch] project context asset read failed: {e}")
+        return ""
+
+    async def _doc_skeleton_precheck(self, task_id: str, step_id: str, name: str,
+                                     args: dict) -> Optional[str]:
+        fp = str((args or {}).get("file_path") or "")
+        filename = os.path.basename(fp.replace("\\", "/"))
+        template = _doc_skeleton_template(filename)
+        if not template:
+            return None
+        step_type = await self._step_type_of(task_id, step_id)
+        template_path = _skeleton_template_path(template)
+        if filename == _CODE_DIAGRAM_FILENAME and step_type != "plan":
+            logger.info(f"[DC:orch] code diagram write denied step={step_id} "
+                        f"type={step_type}")
+            return _doc_diagram_permission_error(step_type, template_path)
+        if name == "dcflow_edit_file":
+            logger.info(f"[DC:orch] doc edit redirected step={step_id} file={filename}")
+            return _doc_edit_redirect_error(filename, template_path)
+        content = str((args or {}).get("content") or "")
+        key = f"{task_id}:{step_id}:{filename}"
+        if self._doc_skeleton_rejects.get(key, 0) >= _DOC_SKELETON_MAX_REJECTS:
+            logger.warning(f"[DC:orch] doc skeleton safety valve open step={step_id} "
+                           f"file={filename}")
+            self._doc_skeleton_rejects.pop(key, None)
+            return None
+        error = _doc_skeleton_error(filename, content, step_id)
+        if error:
+            self._doc_skeleton_rejects[key] = self._doc_skeleton_rejects.get(key, 0) + 1
+            return (f"[拒绝写入] {error}"
+                    f"（写入前拦截：本次 {name} 未执行，文件未改动）")
+        if filename == _PROJECT_CONTEXT_FILENAME and step_type != "report":
+            old = await self._current_project_context(task_id, fp)
+            if old.strip() and _doc_section_body(old, _CONTEXT_SUMMARY_SECTION) \
+                    != _doc_section_body(content, _CONTEXT_SUMMARY_SECTION):
+                logger.info(f"[DC:orch] task summary write denied step={step_id} "
+                            f"type={step_type}")
+                return (f"{_doc_task_summary_error(step_type)}"
+                        f"（写入前拦截：本次 {name} 未执行，文件未改动）")
+        self._doc_skeleton_rejects.pop(key, None)
+        return None
+
+    async def _shared_doc_entries(self, task_id: str, step_id: str,
+                                  code: str) -> list[dict]:
+        from ..step_context import get_task_workspace
+        root = await get_task_workspace(self._storage, task_id)
+        names: dict[str, list[str]] = {
+            _FLOW_REPORT_FILENAME: [_FLOW_REPORT_FILENAME, f"{step_id}-步骤报告.md"],
+            _CODE_DIAGRAM_FILENAME: [_CODE_DIAGRAM_FILENAME],
+            _PROJECT_CONTEXT_FILENAME: [_PROJECT_CONTEXT_FILENAME],
+        }
+        entries: list[dict] = []
+        seen: set = set()
+        for filename, aliases in names.items():
+            if not any(a in code for a in aliases):
+                continue
+            write = read = False
+            for a in aliases:
+                w, r = _doc_write_intent(code, a)
+                write, read = write or w, read or r
+            if filename == _FLOW_REPORT_FILENAME:
+                canon = os.path.normpath(os.path.join(PROJECT_ROOT, ".dc_tmp", task_id,
+                                                       _FLOW_REPORT_FILENAME))
+            else:
+                canon = _project_asset_local_path(task_id, _PROJECT_ASSET_FILES[filename],
+                                                  filename)
+            paths = [canon]
+            for p in _doc_referenced_paths(code, filename):
+                ap = _doc_abs_path(root, p)
+                if ap not in paths:
+                    paths.append(ap)
+            for ap in paths:
+                if ap in seen:
+                    continue
+                seen.add(ap)
+                entries.append({"filename": filename, "path": ap,
+                                "write": write, "read": read})
+        return entries
+
+    async def _before_run_code_docs(self, task_id: str, step_id: str, code: str) -> dict:
+        plan: dict = {"block": None, "docs": [], "snap": {}, "before": {}}
+        if not (code or "").strip():
+            return plan
+        try:
+            docs = await self._shared_doc_entries(task_id, step_id, code)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[DC:orch] run_code doc entries failed step={step_id}: {e}")
+            return plan
+        plan["docs"] = docs
+        if not docs:
+            return plan
+        for it in docs:
+            if it["filename"] == _FLOW_REPORT_FILENAME:
+                await self._restore_flow_report_file(task_id, it["path"])
+            elif not os.path.isfile(it["path"]):
+                await self._pull_project_asset(task_id, step_id, it["filename"])
+        for it in docs:
+            if it["filename"] != _FLOW_REPORT_FILENAME:
+                continue
+            if it["write"] and not it["read"]:
+                action, msg = await self._intercept_step_report(
+                    task_id, step_id, "dcflow_write_file", {"file_path": it["path"]})
+                if action == "block":
+                    plan["block"] = msg
+                    return plan
+        if any(it["filename"] == _CODE_DIAGRAM_FILENAME and it["write"] for it in docs):
+            step_type = await self._step_type_of(task_id, step_id)
+            if step_type != "plan":
+                plan["block"] = (_doc_diagram_permission_error(
+                    step_type, _skeleton_template_path(_DIAGRAM_SKELETON))
+                    + "（写入前拦截：本段代码未执行、文件零改动）")
+                return plan
+        for it in docs:
+            if not it["write"]:
+                continue
+            limit = _DOC_CHAR_LIMITS.get(it["filename"])
+            if not limit:
+                continue
+            cur = 0
+            if os.path.isfile(it["path"]):
+                try:
+                    with open(it["path"], "r", encoding="utf-8") as f:
+                        cur_text = f.read()
+                except (OSError, UnicodeDecodeError):
+                    cur_text = ""
+                cur = len(_strip_trailing_kf_block(cur_text)
+                          if it["filename"] == _FLOW_REPORT_FILENAME else cur_text)
+            if cur + len(code) > limit:
+                plan["block"] = (
+                    f"[Error] {it['filename']} 现有 {cur} 字符 + 本次代码 {len(code)} 字符"
+                    f"已超上限 {limit} 字符：run_code 不能继续改它（判据为「代码长 +"
+                    f"文件现有总长」，写入前拦截、本段代码未执行、文件零改动）。"
+                    f"若要压缩（蒸馏），请改用 dcflow_write_file 一次性写入"
+                    f"≤ {limit} 字符的蒸馏版（该工具按覆盖语义判定，只看新内容长度）。")
+                return plan
+        for it in docs:
+            if it["filename"] == _FLOW_REPORT_FILENAME and it["read"]:
+                try:
+                    await self._save_step_report_read_round(
+                        task_id, step_id, await self._get_step_report_round(task_id, step_id))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[DC:orch] run_code read round save failed step={step_id}: {e}")
+        for it in docs:
+            try:
+                st = os.stat(it["path"])
+                plan["snap"][it["path"]] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                plan["snap"][it["path"]] = None
+            if it["write"]:
+                try:
+                    with open(it["path"], "r", encoding="utf-8") as f:
+                        plan["before"][it["path"]] = f.read()
+                except (OSError, UnicodeDecodeError):
+                    plan["before"][it["path"]] = ""
+        return plan
+
+    async def _after_run_code_docs(self, task_id: str, step_id: str, plan: dict) -> str:
+        msgs: list[str] = []
+        for it in plan.get("docs") or []:
+            if not it.get("write"):
+                continue
+            path, filename = it["path"], it["filename"]
+            try:
+                if not os.path.isfile(path):
+                    continue
+                st = os.stat(path)
+                if plan.get("snap", {}).get(path) == (st.st_mtime_ns, st.st_size):
+                    continue
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            reason = _doc_length_error(filename, content)
+            if not reason and filename == _CODE_DIAGRAM_FILENAME:
+                reason = _validate_code_diagram_content(content)
+            fix_tip = "请修正后重写。"
+            if not reason:
+                reason = _doc_skeleton_error(filename, content)
+                if reason:
+                    fix_tip = (f"请改用 dcflow_write_file 一次性写入符合骨架的整篇（骨架模板："
+                               f"{_skeleton_template_path(_doc_skeleton_template(filename))}）。")
+            if not reason and filename == _PROJECT_CONTEXT_FILENAME:
+                step_type = await self._step_type_of(task_id, step_id)
+                before = str((plan.get("before") or {}).get(path) or "")
+                if step_type != "report" and before.strip() \
+                        and _doc_section_body(before, _CONTEXT_SUMMARY_SECTION) \
+                        != _doc_section_body(content, _CONTEXT_SUMMARY_SECTION):
+                    reason = _doc_task_summary_error(step_type).removeprefix("[拒绝写入] ")
+                    fix_tip = ("请改用 dcflow_write_file 保持「任务总结」章节原样、只更新你负责的"
+                               "章节（该章节只有 final-reporter 可改写）。")
+            if reason:
+                detail = reason[len("[Error] "):] if reason.startswith("[Error] ") else reason
+                logger.info(f"[DC:orch] run_code doc rejected step={step_id} file={filename}")
+                msgs.append(f"[Error] {filename} 写入未通过校验：{detail}"
+                            f"本轮未同步 DB/项目级资产库（磁盘内容保持写入结果，不做回滚），"
+                            f"{fix_tip}")
+                continue
+            try:
+                if filename == _FLOW_REPORT_FILENAME:
+                    await self._mirror_step_report(task_id, step_id, source_path=path)
+                else:
+                    await self._mirror_project_asset(task_id, step_id, filename,
+                                                     source_path=path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[DC:orch] run_code doc mirror failed step={step_id} "
+                               f"file={filename}: {e}")
+        return "\n\n".join(msgs)
+
+
     async def _append_message(self, task_id: str, step_id: str, message: dict,
-                              entity_id: Optional[str] = None) -> int:
+                              entity_id: Optional[str] = None,
+                              publish: bool = True) -> int:
         eid = entity_id or message.get("entity_id")
         seq = await self._storage.append_message(task_id, step_id, message, entity_id=eid)
-        self._publish(task_id, "messagesConfirmed", {
-            "stepId": step_id, "items": [self._msg_item(seq, eid, message)]})
+        if publish:
+            self._publish(task_id, "messagesConfirmed", {
+                "stepId": step_id, "items": [self._msg_item(seq, eid, message)]})
         return seq
 
     @staticmethod
@@ -3199,18 +4221,39 @@ class Orchestrator:
 
     async def _announce_user_message(self, task_id: str, step_id: str, content: str,
                                      *, mid_round: bool = False,
-                                     client_msg_id: Optional[str] = None) -> int:
+                                     client_msg_id: Optional[str] = None,
+                                     queued: bool = False,
+                                     round_num: Optional[int] = None) -> int:
         client_msg_id = client_msg_id or f"um-{uuid4().hex}"
-        seq = await self._append_message(task_id, step_id,
-                                         {"role": "user", "content": content,
-                                          "round_num": -1},
-                                         entity_id=client_msg_id)
+        msg_row = {"role": "user", "content": content, "round_num": -1}
+        seq = await self._append_message(task_id, step_id, msg_row,
+                                         entity_id=client_msg_id,
+                                         publish=not queued)
+        if queued:
+            self._queued_user_confirms.setdefault(
+                f"{task_id}:{step_id}", {})[client_msg_id] = \
+                self._msg_item(seq, client_msg_id, msg_row)
         if mid_round:
             self._mid_round_user_seqs.setdefault(f"{task_id}:{step_id}", []).append(seq)
         self._publish(task_id, "userMessage",
                       {"stepId": step_id, "message": content, "msgSeq": seq,
-                       "entityId": client_msg_id, "midRound": mid_round})
+                       "entityId": client_msg_id, "midRound": mid_round,
+                       "roundNum": round_num})
         return seq
+
+    def _take_queued_user_confirm(self, task_id: str, step_id: str,
+                                  entity_id: Optional[str],
+                                  content: str) -> Optional[dict]:
+        bucket = self._queued_user_confirms.get(f"{task_id}:{step_id}")
+        if not bucket:
+            return None
+        if entity_id and entity_id in bucket:
+            return bucket.pop(entity_id)
+        for eid, item in list(bucket.items()):
+            if item.get("content") == content:
+                del bucket[eid]
+                return item
+        return None
 
     def is_round_in_flight(self, task_id: str, step_id: str) -> bool:
         return bool(self._round_in_flight.get(f"{task_id}:{step_id}"))
@@ -3223,6 +4266,13 @@ class Orchestrator:
             new_seqs = await self._storage.move_messages_to_end(task_id, step_id, seqs)
             logger.info(f"[DC:orch] mid-round user messages reordered step={step_id} "
                         f"old={seqs} new={new_seqs}")
+            bucket = self._queued_user_confirms.get(f"{task_id}:{step_id}")
+            if bucket and new_seqs:
+                by_old = {old: new for old, new in zip(seqs, new_seqs)}
+                for item in bucket.values():
+                    old = item.get("seq")
+                    if old in by_old:
+                        item["seq"] = by_old[old]
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[DC:orch] mid-round user message reorder failed "
                            f"step={step_id}: {e}")
@@ -3350,9 +4400,11 @@ class Orchestrator:
             r = rounds[i]
             tool_calls = r.get("toolCalls", [])
             round_uid = r.get("roundUid")
-            if (r.get("text") or "").strip() or tool_calls:
+            if (r.get("text") or "").strip() or tool_calls or (r.get("reasoning") or "").strip():
                 entry: dict = {"role": "assistant", "content": r.get("text", "") or "",
                                "round_num": i}
+                if r.get("reasoning"):
+                    entry["reasoning"] = r["reasoning"]
                 if tool_calls:
                     entry["tool_calls"] = json.dumps([
                         {"id": tc.get("call_id") or f"call_{i}_{j}", "type": "function",
@@ -3623,8 +4675,30 @@ class Orchestrator:
                     "items": [self._msg_item(r["seq"], r.get("entity_id"), r)
                               for r in rows]})
 
-        async for event in self.sse_hub.subscribe(task_id, last_seq=last_seq):
-            yield event
+        agen = self.sse_hub.subscribe(task_id, last_seq=last_seq).__aiter__()
+        nxt: Optional[asyncio.Task] = asyncio.ensure_future(agen.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {nxt}, timeout=self.HEARTBEAT_INTERVAL_S)
+                if not done:
+                    yield {"command": "heartbeat", "taskId": task_id,
+                           "seq": self.sse_hub.last_seq(task_id)}
+                    continue
+                try:
+                    event = nxt.result()
+                except StopAsyncIteration:
+                    return
+                yield event
+                nxt = asyncio.ensure_future(agen.__anext__())
+        finally:
+            if not nxt.done():
+                nxt.cancel()
+                try:
+                    await nxt
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+            await agen.aclose()
 
     def _emit_chunk(self, task_id: str, step_id: str, chunk: str,
                     entity_id: Optional[str] = None) -> None:

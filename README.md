@@ -229,7 +229,6 @@ DimensionCoder/
 │       ├── monitor_context.py   # Monitor orchestration context
 │       ├── graceful.py          # graceful shutdown / restart recovery
 │       ├── tool_security.py     # tool path safety (out-of-bounds guard)
-│       ├── API.md               # REST API contract doc
 │       ├── brain/               # LLM & orchestration: llm_client / orchestrator / mcp_client / sse_hub
 │       ├── state_machine/       # task & step state machine, task types
 │       ├── storage/             # SQLite persistence (adapter / sqlite_adapter / migration)

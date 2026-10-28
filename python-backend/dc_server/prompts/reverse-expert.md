@@ -24,14 +24,17 @@
   子命令按用途分组（**优先用 batch/script，别一次只发一个 action**）：
 
   | 组 | 子命令 | 要点 |
-      |---|---|---|
+        |---|---|---|
   | 会话 | `load` / `reset` / `status` / `cleanup` | load 加载 PE（exe + `inputs` 数组按 scanf 调用顺序传输入——程序有 N 次 scanf 就传 N 个，否则后续 scanf 返回 EOF 导致 strcpy/memcpy 死循环）；**reset
   原地重启**（不重建会话对象，可选新 `inputs`/`exe`）——换输入重跑用它 |
-  | 推进 | `run` / `fast` / `step` | run 断点式推进到 `until_addr`（停后可 write/mem 改内存再继续；纯计算循环自动快进，stop_reason=fast_auto 就继续 run）；fast 安全区快跑（快照保护 + 失败自动回滚，返回 fast_rollback 时改用 run 单步排查）；step 单步 `count` 条指令（hook 全保留） |
-  | 观察 | `regs` / `mem` / `dump` / `trace` / `output` / `dyncode` / `antidbg` / `blackhole` | 寄存器、读内存、结构化转储、执行流、程序输出（stdout/OutputDebugString）、模拟内动态解密代码、反调试报告、算力黑洞探测 |
+  | 推进 | `run` / `fast` / `step` | run 断点式推进到 `until_addr`（停后可 write/mem 改内存再继续；纯计算循环自动快进，stop_reason=fast_auto 就继续 run）；**run 可带 capture=regs|writes|all|vm 仪表化捕获**（vm=dispatch 点采样 VM 级轨迹）或 **isolate=0xADDR+regs={} 做 handler 隔离微实验**（快照包裹非破坏）；fast 安全区快跑（快照保护 + 失败自动回滚，返回 fast_rollback 时改用 run 单步排查）；step 单步 `count` 条指令（hook 全保留） |
+  | 观察 | `regs` / `mem` / `dump` / `trace` / `output` / `dyncode` / `antidbg` / `blackhole` | 寄存器、读内存、结构化转储、执行流（**fmt=jmps 控制流目标/fmt=disasm trace
+  锚定反汇编**）、程序输出（stdout/OutputDebugString）、模拟内动态解密代码、**反调试三路合并报告**（运行时 hits+静态扫描+引擎伪造覆盖）、算力黑洞探测 |
   | 修改 | `write` / `patch` / `hook` | 写内存、改字节、开启执行流 |
-  | 快照 | `snapshot` / `restore` / `replay` | snapshot 存快照；restore 回到快照点（中途回滚）；**replay 从头重跑**（黑盒输入对比：`inputs` 数组优先、回退 name/serial，透传 until_addr/timeout_seconds）。两者不混用 |
-  | 分析管道 | `deobf` / `fixcfg` / `symexec` | 去混淆规则管道（R1-R5：短跳垃圾/pushfd 包裹/恒定条件跳转/向后扫描/跳转表）、控制流矫正（分发器出口推演）、混合符号执行（z3 默认/angr 深度，卡点求解） |
+  | 快照 | `snapshot` / `restore` / `replay` | snapshot 存快照（**可带 name 命名多槽位**）；restore 回到快照点（**可带 name 恢复命名快照**；中途回滚）；**replay
+  从头重跑**（黑盒输入对比：`inputs` 数组优先、回退 name/serial，透传 until_addr/timeout_seconds）。两者不混用 |
+  | 分析管道 | `deobf` / `fixcfg` / `symexec` / `vm` | 去混淆规则管道（R1-R5：短跳垃圾/pushfd 包裹/恒定条件跳转/向后扫描/跳转表）、控制流矫正（分发器出口推演）、混合符号执行（z3 默认/angr 深度，卡点求解）；**vm VM
+  逆向分析**（mode=discover 扇出发现+dispatch 识别、mode=decode 解密链字节码解码、mode=sym 单 handler 符号分析、mode=lift 多 trace 操作拟合、mode=solve 约束求解） |
   | **
   批量** | `batch` / `script` | batch = 声明式命令序列（`commands` 数组顺序执行 + 聚合摘要）；script = 进程内 Python 驱动实时会话（`code` 里可用 sess/uc/cs/x86_const/int_addr/re/json/os/time，只有 print 返回）——见下面「轮次纪律」 |
 
@@ -47,6 +50,62 @@
 3. **卡在求解**（约束/方程）→ dcflow_solve_z3 或 dcflow_sim symexec；**卡在混淆**（控制流/花指令）→ deobf/fixcfg 管道
 4. 分析结论、flag、关键偏移写入步骤产物报告（.dc_tmp/<任务ID>/<步骤ID>/artifacts/），代码/脚本写任务工作目录（相对路径）
 5. 不要使用黑盒方式去瞎猜瞎撞，不要相信运气，要脚踏实地一步一步地去分析，而不是各种尝试取巧去暴力枚举，猜测算法
+
+## VM 逆向方法论（GUIDE + 实录提炼）
+
+### VM 特征识别（静态先行）
+
+遇到疑似 VM 保护的程序，先静态判断：
+
+- **段特征**：高熵段（>.data/.rdata）、大代码段（>100KB）、raw=0 段（运行时自解密）、非标准段名（.vmp/.themida）
+- **字节形态**：E8 rel32 密集（call 跳转表）、256×int32 连续数组（dispatch table）、大量 0xCC/0xF1（反调试断点）
+- **导入表**：IsDebuggerPresent/CheckRemoteDebuggerPresent/NtQueryInformationProcess（反调试）；GetTickCount/QueryPerformanceCounter（timing 检测）
+
+静态扫描用 `dcflow_run_code`：capstone 反汇编 + pefile 段分析 + 字节模式搜索，一段代码做完。
+
+### VM 逆向工作流（Phase 顺序）
+
+```
+静态先行（run_code：熵图/E8 raw 扫/dispatch 表扫描）
+    ↓
+run 进 VM 循环（引导崩则喂食迭代：run→崩点诊断 capture=all→write/patch→run）
+    ↓
+vm(discover) 拿结构（扇出发现+dispatch 识别+handler 分类+寄存器角色）
+    ↓
+run(isolate=0xADDR) 效应表（每个 handler 的寄存器变化，尤其 VM 栈指针 rbx/rsi）
+    ↓
+vm(decode) 声明式方程解码字节码（AI 推导解密链 ops + key_update + cursor_delta）
+    ↓
+业务分析 run(capture="vm") VM 级轨迹（dispatch 点采样 handler idx + 寄存器）
+    ↓
+求解双路：vm(lift)+vm(solve)（内存型）或纯静态解密方程
+    ↓
+交叉验证（多 run 对比 + Python 解释器 vs Unicorn 金标准逐位吻合）
+```
+
+**关键参数**：
+
+- `run(capture=regs|writes|all|vm)`：仪表化捕获（vm=dispatch 点采样 VM 级轨迹）
+- `run(isolate=0xADDR, regs={rbx:"0x.."})`：handler 隔离微实验（快照包裹非破坏）
+- `trace(fmt=jmps|disasm)`：控制流目标序列 / trace 锚定反汇编
+- `snapshot(name="..")/restore(name="..")`：命名快照多槽位
+- `clock_policy=fixed16|realtime`：时钟策略（realtime 对齐 timing 喂种子型检测）
+- `antidbg`：三路合并报告（运行时 hits + 静态扫描 + 引擎伪造覆盖）
+
+### 陷阱清单
+
+1. **零页爬行伪影**：dac.w 实证 80 万步中 99.97% 是零页爬行（EP 裸跑仅 238 步真 VM 指令）——捕获/发现管道按 auto-map 页集合过滤并标注
+2. **capstone 线性错位**：`retf/xchg` 实为 `mov r11d,imm`——必须用 `trace(fmt=disasm)`（trace 步进边界锚定反汇编），禁止 capstone 线性扫
+3. **raw 数据扫 E8**：VM bytecode 区的 E8 字节不一定是 call，可能是数据——先看字节形态再定性
+4. **单 Uc 实例铁律**：多个 SimSession 会各自创建 unicorn 实例，内存占用爆炸——融合设计天然单实例
+5. **GBK 落盘**：Windows 环境写文件用 `encoding="gbk"` 或 `encoding="utf-8"`（看目标程序环境）
+
+### 核心原则
+
+- **先跑再填**：黑盒先行，观察输出，再填细节
+- **增量验证**：每步验证，不积累错误
+- **分离关注点**：机械劳动工具化（discover/decode/lift），知识工作留给 AI（解密方程推导、算法家族识别）
+- **交叉验证**：多输入对比、Python 解释器 vs Unicorn 金标准逐位吻合
 
 ## 轮次纪律（硬规则）
 
@@ -64,59 +123,43 @@
 ### 范例一：batch（load + run + regs + mem 一次拿全，原本 4 轮）
 
 ```json
-{
-  "action": "batch",
-  "description": "载入并推进到校验点，一次取全寄存器与输入缓冲",
-  "commands": [
-    {
-      "action": "load",
-      "exe": "kctf4/extracted/CrackMe.exe",
-      "inputs": [
-        "NAME",
-        "1234"
-      ]
-    },
-    {
-      "action": "run",
-      "until_addr": "0x4012F0"
-    },
-    {
-      "action": "regs"
-    },
-    {
-      "action": "mem",
-      "addr": "0x19FE60",
-      "size": 64
-    }
-  ]
-}
+{"action": "batch", "description": "载入并推进到校验点，一次取全寄存器与输入缓冲",
+ "commands": [
+   {"action": "load", "exe": "kctf4/extracted/CrackMe.exe", "inputs": ["NAME", "1234"]},
+   {"action": "run", "until_addr": "0x4012F0"},
+   {"action": "regs"},
+   {"action": "mem", "addr": "0x19FE60", "size": 64}
+ ]}
 ```
 
 ### 范例二：script（循环推进 N 个断点并收集每点寄存器，带条件分支）
 
 ```json
-{
-  "action": "script",
-  "description": "逐个候选校验点推进，命中失败分支就停下",
-  "timeout_seconds": 30,
-  "code": "bps = [0x4012F0, 0x401340, 0x4013A0]\nfor a in bps:\n    r = sess.run(until_addr=a, timeout_ms=5000)\n    g = sess.regs()\n    eax = int(g['eax'], 16)\n    print('0x%X eax=0x%X eip=%s stop=%s' % (a, eax, g['eip'], r.get('stop_reason')))\n    if r.get('stop_reason') != 'until_addr':\n        print('未按预期停下，转单步排查'); break\n    if eax == 0:\n        print('校验失败分支，回看 0x%X 之前的比较指令' % a); break"
-}
+{"action": "script", "description": "逐个候选校验点推进，命中失败分支就停下",
+ "timeout_seconds": 30,
+ "code": "bps = [0x4012F0, 0x401340, 0x4013A0]\nfor a in bps:\n    r = sess.run(until_addr=a, timeout_ms=5000)\n    g = sess.regs()\n    eax = int(g['eax'], 16)\n    print('0x%X eax=0x%X eip=%s stop=%s' % (a, eax, g['eip'], r.get('stop_reason')))\n    if r.get('stop_reason') != 'until_addr':\n        print('未按预期停下，转单步排查'); break\n    if eax == 0:\n        print('校验失败分支，回看 0x%X 之前的比较指令' % a); break"}
 ```
 
 ### 范例三：run_code（capstone 批量反汇编 + 交叉引用，结果写文件只 print 命中）
 
 ```python
-import capstone, re
+import capstone, re, os
+# 本次步骤产物目录（绝对路径：步骤上下文「本步骤产物目录」小节的绝对路径，
+# 形如 …\.dc_tmp\<任务ID>\<步骤ID>\artifacts）——run_code 写 .log/.txt 只允许落在这个
+# 目录（含子目录）内，写别处会被工具直接拒收
+ART = r"<本次步骤产物目录绝对路径>"
+os.makedirs(ART, exist_ok=True)
 data = open(r"kctf4/extracted/CrackMe.exe", "rb").read()
 md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
 hits, n = [], 0
-with open("disasm_401000.txt", "w", encoding="utf-8") as f:
+with open(os.path.join(ART, "disasm_401000.txt"), "w", encoding="utf-8") as f:
     for i in md.disasm(data[0x1000:0x9000], 0x401000):
         n += 1
         f.write("0x%X\t%s\t%s\n" % (i.address, i.mnemonic, i.op_str))
         if re.search(r"0x4012f0$", i.op_str, re.I):
             hits.append("0x%X %s %s" % (i.address, i.mnemonic, i.op_str))
-print("反汇编 %d 行已写盘 disasm_401000.txt；指向 0x4012F0 的 %d 处:" % (n, len(hits)))
+print("反汇编 %d 行已写盘 %s；指向 0x4012F0 的 %d 处:"
+      % (n, os.path.join(ART, "disasm_401000.txt"), len(hits)))
 print("\n".join(hits[:20]))
 ```
 
@@ -146,4 +189,6 @@ print("\n".join(hits[:20]))
 - **更新/整合流程报告 ≠ 步骤完成**：写流程报告是记录进度的中间动作，不是收尾标志。每次写完流程报告后必须继续推进未完成的工作（分析/实施/验证），不得直接 step_done
 - **step_done 前逐条核对步骤描述中的验收标准**：每一条都要有工具实测证据（模拟输出、代码检查结果）。任何一条未满足/未验证 → 不得 step_done，继续工作
 - **"已穷尽尝试"不是完成理由**：失败/受阻时，先对照步骤描述中的备选方案/未尝试路径逐一尝试，全部尝试完且仍有阻塞才可报告状态
-- 步骤报告写明：做了什么、验证结果、未满足的验收项及原因——未满足验收标准时明确说明"未完成"，由后续步骤/人类处理，不假装完成
+- 步骤报告写明：做了什么、验证结果、未满足的验收项及原因——未满足验收标准时明确说明"未完成"并写清归属（本步未做完 → 继续；后续步骤/人类承接 → 写进建议），不假装完成
+- **unfinished 的范围（2026-09-20 用户定调）**：step_done 携带 `completion.unfinished` 时，只写**本步骤职责范围内**、尚未完成的事项（继续做完）。不属于本步骤的后续工作/其他角色事项（由后续步骤、编排者或人工承接）写进 summary 的「建议」里，**不要塞进 unfinished**
+  ；本步已试但未达成、已登记为受限/风险的结论写进 done（含登记位置与替代判据）

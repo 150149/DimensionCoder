@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 from .adapter import StorageAdapter
 from ..observability import install_slow_db_logging
 
+_REASONING_MAX_CHARS = 200_000
+
 
 
 DDL_STATEMENTS = [
@@ -39,6 +41,7 @@ DDL_STATEMENTS = [
         assignee TEXT,
         auto_approve INTEGER DEFAULT 0,
         workspace_dir TEXT,
+        mode TEXT DEFAULT 'flow',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
@@ -128,6 +131,7 @@ DDL_STATEMENTS = [
         tool_output TEXT,
         round_num INTEGER NOT NULL DEFAULT 0,
         entity_id TEXT,
+        reasoning TEXT,
         created_at TEXT NOT NULL
     )
     """,
@@ -189,6 +193,7 @@ class SQLiteAdapter(StorageAdapter):
         self._migrate_task_steps_tokens()
         self._migrate_tasks_auto_approve()
         self._migrate_tasks_workspace_dir()
+        self._migrate_tasks_mode()
         self._migrate_flow_reports()
         self._migrate_monitor_instances()
         self._migrate_monitor_entities()
@@ -223,6 +228,12 @@ class SQLiteAdapter(StorageAdapter):
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()}
         if "workspace_dir" not in cols:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN workspace_dir TEXT")
+
+    def _migrate_tasks_mode(self) -> None:
+        assert self._conn is not None
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "mode" not in cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN mode TEXT DEFAULT 'flow'")
 
     def _migrate_flow_reports(self) -> None:
         import re
@@ -406,6 +417,8 @@ class SQLiteAdapter(StorageAdapter):
             self._conn.execute("ALTER TABLE step_messages ADD COLUMN tool_calls TEXT")
         if "entity_id" not in cols:
             self._conn.execute("ALTER TABLE step_messages ADD COLUMN entity_id TEXT")
+        if "reasoning" not in cols:
+            self._conn.execute("ALTER TABLE step_messages ADD COLUMN reasoning TEXT")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sm_entity ON step_messages(task_id, step_id, entity_id)")
 
@@ -499,8 +512,8 @@ class SQLiteAdapter(StorageAdapter):
         now = self._now()
 
         conn.execute(
-            """INSERT INTO tasks (id, epic_id, type, title, description, status, pause_level, assignee, auto_approve, workspace_dir, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (id, epic_id, type, title, description, status, pause_level, assignee, auto_approve, workspace_dir, mode, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task_id,
                 task.get("epic_id"),
@@ -512,6 +525,7 @@ class SQLiteAdapter(StorageAdapter):
                 task.get("assignee", ""),
                 1 if task.get("auto_approve") else 0,
                 task.get("workspace_dir"),
+                task.get("mode") or "flow",
                 task.get("created_at", now),
                 now,
             ),
@@ -569,7 +583,7 @@ class SQLiteAdapter(StorageAdapter):
         now = self._now()
 
         task_fields = ["title", "description", "status", "pause_level", "assignee",
-                       "epic_id", "type", "auto_approve"]
+                       "epic_id", "type", "auto_approve", "mode"]
         set_clauses = []
         params = []
         for field in task_fields:
@@ -638,7 +652,7 @@ class SQLiteAdapter(StorageAdapter):
         if exists:
             return
         row = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM task_steps WHERE task_id = ?",
+            "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM task_steps WHERE task_id = ?",
             (task_id,)).fetchone()
         conn.execute(
             "INSERT INTO task_steps (task_id, step_id, title, status, type, sort_order, required) "
@@ -651,7 +665,7 @@ class SQLiteAdapter(StorageAdapter):
                               context_tokens: Optional[int] = None) -> None:
         conn = await self._get_conn()
         row = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM task_steps WHERE task_id = ?",
+            "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM task_steps WHERE task_id = ?",
             (task_id,)).fetchone()
         conn.execute(
             """INSERT OR IGNORE INTO task_steps
@@ -679,7 +693,7 @@ class SQLiteAdapter(StorageAdapter):
                                 run_ms: Optional[int] = None) -> None:
         conn = await self._get_conn()
         row = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM task_steps WHERE task_id = ?",
+            "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM task_steps WHERE task_id = ?",
             (task_id,)).fetchone()
         conn.execute(
             """INSERT OR IGNORE INTO task_steps
@@ -772,6 +786,27 @@ class SQLiteAdapter(StorageAdapter):
             for r in rows
         }
 
+    async def get_daily_token_usage(self, days: int) -> list[dict]:
+        conn = await self._get_conn()
+        rows = conn.execute(
+            """SELECT date(COALESCE(
+                         (SELECT MAX(sm.created_at) FROM step_messages sm
+                           WHERE sm.task_id = ts.task_id AND sm.step_id = ts.step_id),
+                         tk.updated_at), 'localtime') AS day,
+                        SUM(COALESCE(ts.token_prompt, 0))     AS prompt,
+                        SUM(COALESCE(ts.token_cached, 0))     AS cached,
+                        SUM(COALESCE(ts.token_completion, 0)) AS completion
+                   FROM task_steps ts JOIN tasks tk ON tk.id = ts.task_id
+                  GROUP BY day
+                  ORDER BY day DESC LIMIT ?""",
+            (max(int(days), 1),),
+        ).fetchall()
+        return [
+            {"date": r["day"], "prompt": r["prompt"] or 0,
+             "cached": r["cached"] or 0, "completion": r["completion"] or 0}
+            for r in reversed(rows)
+        ]
+
     async def add_steps(self, task_id: str, steps: list[dict],
                         after_step_id: Optional[str] = None) -> None:
         conn = await self._get_conn()
@@ -790,6 +825,7 @@ class SQLiteAdapter(StorageAdapter):
                 for i, step in enumerate(steps):
                     step["sort_order"] = anchor + 1 + i
                 await self._insert_steps(conn, task_id, steps)
+                self._compact_sort_orders(conn, task_id)
                 conn.commit()
                 return
         row = conn.execute(
@@ -812,7 +848,16 @@ class SQLiteAdapter(StorageAdapter):
         for i, step in enumerate(steps):
             step["sort_order"] = max_order + i
         await self._insert_steps(conn, task_id, steps)
+        self._compact_sort_orders(conn, task_id)
         conn.commit()
+
+    def _compact_sort_orders(self, conn: sqlite3.Connection, task_id: str) -> None:
+        rows = conn.execute(
+            "SELECT id FROM task_steps WHERE task_id = ? "
+            "ORDER BY sort_order, id", (task_id,)).fetchall()
+        for i, r in enumerate(rows):
+            conn.execute("UPDATE task_steps SET sort_order = ? WHERE id = ?",
+                         ((i + 1) * 10, r[0]))
 
     def _migrate_monitor_unbind(self) -> None:
         assert self._conn is not None
@@ -889,6 +934,7 @@ class SQLiteAdapter(StorageAdapter):
                 "UPDATE task_steps SET sort_order = ? WHERE task_id = ? AND step_id = ?",
                 (base + i, task_id, step_id),
             )
+        self._compact_sort_orders(conn, task_id)
         conn.commit()
 
 
@@ -1071,8 +1117,8 @@ class SQLiteAdapter(StorageAdapter):
         else:
             next_seq = seq
         conn.execute(
-            """INSERT INTO step_messages (task_id, step_id, seq, role, content, tool_call_id, tool_calls, tool_name, tool_input, tool_output, round_num, entity_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO step_messages (task_id, step_id, seq, role, content, tool_call_id, tool_calls, tool_name, tool_input, tool_output, round_num, entity_id, reasoning, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task_id, step_id, next_seq,
                 message.get("role", ""),
@@ -1084,6 +1130,7 @@ class SQLiteAdapter(StorageAdapter):
                 message.get("output", "")[:10000] if message.get("output") else None,
                 message.get("round_num", 0),
                 entity_id,
+                str(message.get("reasoning") or "")[:_REASONING_MAX_CHARS] or None,
                 now,
             ),
         )
@@ -1251,63 +1298,18 @@ class SQLiteAdapter(StorageAdapter):
         conn.commit()
 
 
-    async def export_for_ai(self, task_id: str, step_id: str, target_dir: str) -> dict:
+    async def export_step_conversation(self, task_id: str, step_id: str, target_dir: str) -> str:
         import os
 
+        msgs = await self.get_step_messages(task_id, step_id)
+        if not msgs:
+            return ""
         os.makedirs(target_dir, exist_ok=True)
-
-        task = await self.get_task(task_id)
-        if not task:
-            raise ValueError(f"Task not found: {task_id}")
-
-        task_context = {
-            "task_id": task["id"],
-            "type": task["type"],
-            "title": task["title"],
-            "description": task.get("description", ""),
-            "status": task["status"],
-            "current_step_id": step_id,
-            "steps": task.get("steps", []),
-        }
-        task_context_path = os.path.join(target_dir, "task_context.json")
-        with open(task_context_path, "w", encoding="utf-8") as f:
-            json.dump(task_context, f, ensure_ascii=False, indent=2)
-
-        artifacts_dir = os.path.join(target_dir, "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
-        artifacts = await self.list_artifacts(task_id)
-        for a in artifacts:
-            ext = "md" if a.get("content_format") == "markdown" else "json"
-            filename = f"{a['step_id']}-{a['artifact_type']}.{ext}"
-            with open(os.path.join(artifacts_dir, filename), "w", encoding="utf-8") as f:
-                f.write(a["content"])
-
-        conversations_dir = os.path.join(target_dir, "conversations")
-        os.makedirs(conversations_dir, exist_ok=True)
-        all_steps = task.get("steps", [])
-        for s in all_steps:
-            sid = s.get("step_id", "")
-            if sid == step_id:
-                continue
-            msgs = await self.get_step_messages(task_id, sid)
-            if msgs:
-                filename = f"{sid}-conversation.json"
-                with open(os.path.join(conversations_dir, filename), "w", encoding="utf-8") as f:
-                    json.dump(msgs, f, ensure_ascii=False, indent=2)
-
-        process_paths = []
-        for a in artifacts:
-            if a["artifact_type"] == "process" and a["step_id"] != step_id:
-                ext = "md" if a.get("content_format") == "markdown" else "json"
-                pp = os.path.join(artifacts_dir, f"{a['step_id']}-process.{ext}")
-                process_paths.append(pp)
-
-        return {
-            "task_context_path": task_context_path,
-            "artifacts_dir": artifacts_dir,
-            "conversations_dir": conversations_dir,
-            "process_paths": process_paths,
-        }
+        msgs = [{k: v for k, v in m.items() if k != "reasoning"} for m in msgs]
+        path = os.path.join(target_dir, "conversation.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(msgs, f, ensure_ascii=False, indent=2)
+        return path
 
 
     async def query_tasks(

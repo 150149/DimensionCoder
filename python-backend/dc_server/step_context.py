@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
 from .storage.adapter import StorageAdapter
-from .prompts import load_prompt, rules_dir
+from .prompts import load_prompt, rules_dir, templates_dir
 from .prompts.registry import get_step_prompt
 from .config import PROJECT_ROOT
 
@@ -25,7 +25,7 @@ STEP_TYPE_MODEL_TIER = {
     "code_review": "light", "report": "light", "researcher": "light",
     "requirement": "light",
     "plan": "power", "review": "power", "reverse": "power",
-    "architect": "power",
+    "architect": "power", "plan_review": "power",
 }
 
 
@@ -125,10 +125,6 @@ def _describe_step(title: str, task_type: str) -> str:
 
 
 
-_TEMP_DIR_CACHE: dict[str, str] = {}
-
-
-
 
 def get_step_temp_dir(task_id: str, step_id: str) -> str:
     return os.path.join(PROJECT_ROOT, ".dc_tmp", task_id, step_id)
@@ -200,27 +196,14 @@ PROJECT_ASSET_CANON = {
 }
 PROJECT_ASSET_TYPES = (CODE_DIAGRAM_ASSET, PROJECT_CONTEXT_ASSET)
 
-PROJECT_CONTEXT_SKELETON = """# 项目背景与约定
-
-> 项目级共享资产：同一项目路径下的所有流程共用这一份。获得项目级结论时
-> 更新对应章节，一条一行、标注日期；不写本次任务的执行过程（那属于流程报告）。
-
-## 项目信息
-
-（技术栈、目录结构、构建与运行方式、关键依赖、外部约束）
-
-## 开发规范
-
-（命名与分层、注释口径、测试要求、禁止事项）
-
-## 经验教训
-
-（踩过的坑与规避方式，注明现象 / 根因 / 做法）
-
-## 任务总结
-
-（每个流程收尾追加一条：做了什么、结论、未决项）
-"""
+def _project_context_skeleton() -> str:
+    path = os.path.join(templates_dir(), "项目背景与约定骨架.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ("# 项目背景与约定\n\n## 项目信息\n\n## 开发规范\n\n"
+                "## 经验教训\n\n## 任务总结\n")
 
 
 def project_asset_local_path(task_id: str, asset_type: str, filename: str = "") -> str:
@@ -273,7 +256,7 @@ async def sync_project_assets(storage, task_id: str) -> None:
             asset = await load_project_asset(storage, task_id, asset_type)
             if not asset and asset_type == PROJECT_CONTEXT_ASSET:
                 await storage.save_project_asset(
-                    key, asset_type, PROJECT_CONTEXT_SKELETON, "text",
+                    key, asset_type, _project_context_skeleton(), "text",
                     project_path=path, source_task_id=task_id)
                 asset = await storage.get_project_asset(key, asset_type)
             if not asset:
@@ -393,16 +376,20 @@ def list_prior_step_outputs(task_id: str, steps: list, current_step_id: str) -> 
     for s in steps:
         if s.get("step_id") == current_step_id:
             continue
+        if s.get("status") != "completed":
+            continue
         p = get_step_temp_dir(task_id, s["step_id"])
         if not os.path.isdir(p):
             continue
+        has_conv = os.path.isfile(os.path.join(p, "conversation.json"))
         md_files: list[str] = []
         other_count = 0
         for root, _, fnames in os.walk(p):
             for fn in sorted(fnames):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, PROJECT_ROOT).replace(os.sep, "/")
-                if rel.startswith(f".dc_tmp/{task_id}/{s['step_id']}/conversations/") \
+                if fn == "conversation.json" \
+                        or rel.startswith(f".dc_tmp/{task_id}/{s['step_id']}/conversations/") \
                         or rel.endswith("task_context.json"):
                     continue
                 if fn.startswith("_flow-") or fn.endswith(("-summary.json",
@@ -417,7 +404,7 @@ def list_prior_step_outputs(task_id: str, steps: list, current_step_id: str) -> 
                     md_files.append(rel)
                 else:
                     other_count += 1
-        if not md_files and not other_count:
+        if not md_files and not other_count and not has_conv:
             continue
         line = f"- {s['step_id']}「{s.get('title', '')}」"
         if md_files:
@@ -425,6 +412,8 @@ def list_prior_step_outputs(task_id: str, steps: list, current_step_id: str) -> 
         if other_count:
             line += (f"（另有 {other_count} 个非 .md 产物在该步骤 artifacts/ 目录，"
                      "用 dcflow_list_dir 查看、dcflow_read_file 按需读取）")
+        if has_conv:
+            line += f"（对话原文: .dc_tmp/{task_id}/{s['step_id']}/conversation.json）"
         lines.append(line)
     return lines
 
@@ -457,16 +446,7 @@ class StepContext:
         if not step:
             raise ValueError(f"Step not found: {step_id}")
 
-        cache_key = f"{task_id}:{step_id}"
-        if cache_key in _TEMP_DIR_CACHE and os.path.isdir(_TEMP_DIR_CACHE[cache_key]):
-            tmp_dir = _TEMP_DIR_CACHE[cache_key]
-            export_result = {"conversations_dir": os.path.join(tmp_dir, "conversations"),
-                             "artifacts_dir": os.path.join(tmp_dir, "artifacts")}
-        else:
-            tmp_dir = get_step_temp_dir(task_id, step_id)
-            os.makedirs(tmp_dir, exist_ok=True)
-            _TEMP_DIR_CACHE[cache_key] = tmp_dir
-            export_result = await self.storage.export_for_ai(task_id, step_id, tmp_dir)
+        tmp_dir = get_step_temp_dir(task_id, step_id)
         await sync_project_assets(self.storage, task_id)
 
         step_desc = step.get("description") or _describe_step(step.get("title", ""), task.get("type", ""))
@@ -502,14 +482,13 @@ class StepContext:
             )
         step_context += (
             "## 项目级共享资产\n"
-            "以下两份按项目路径共享（同一项目的所有流程共用一份，你的修改会同步到其他流程）：\n"
-            f"- {CODE_DIAGRAM_FILENAME}（在你的临时文件夹 .dc_tmp/{task_id}/）——项目代码怎么跑："
-            "入口到出口的所有路线、每个分支的走向条件（Mermaid 图）。"
-            "**不是本次任务的执行步骤流程图**。"
-            "可用 dcflow_read_file 读，dcflow_write_file/dcflow_edit_file 改\n"
-            f"- {PROJECT_CONTEXT_FILENAME}（同目录）——项目级常识：项目信息 / 开发规范 / "
-            "经验教训 / 任务总结。开工前先读一遍；获得项目级结论时更新对应章节\n"
-            "（本流程未选自定义工作目录时，这两份只属于本流程，不与其他流程共享）\n\n"
+            "以下两份按项目路径共享（同一项目的所有流程共用一份，修改会同步到其他流程）：\n"
+            f"- {CODE_DIAGRAM_FILENAME}（.dc_tmp/{task_id}/）\n"
+            f"- {PROJECT_CONTEXT_FILENAME}（.dc_tmp/{task_id}/）\n"
+            "骨架模板（写前先用 dcflow_read_file 读）：\n"
+            f"- 流程报告 → {templates_dir()}/流程报告骨架.md\n"
+            f"- 代码流程图 → {templates_dir()}/代码流程图骨架.md\n"
+            f"- 项目背景与约定 → {templates_dir()}/项目背景与约定骨架.md\n\n"
         )
         if step.get("type") == "plan":
             step_context += (
@@ -603,18 +582,15 @@ class StepContext:
                 + "\n".join(gate_decisions) + "\n\n"
             )
         prior_outputs = list_prior_step_outputs(task_id, task.get("steps", []), step_id)
-        if prior_outputs:
-            step_context += (
-                "## 前序步骤产物文件（仅列 .md 报告/方案；其余产物在各步骤 artifacts/ 目录，按需读取）\n"
-                + "\n".join(prior_outputs) + "\n\n"
-            )
+        step_context += "## 前序步骤资料（引用式：文件在各步骤自己的目录，按需 dcflow_read_file）\n"
         step_context += (
-            f"## 上下文数据\n"
-            f"前序步骤的对话记录已导出到临时文件夹: {tmp_dir}\n\n"
-            f"目录结构:\n"
-            f"  - {tmp_dir}/task_context.json    → 任务和步骤定义\n"
-            f"  - {tmp_dir}/conversations/       → 前序步骤完整对话（{export_result.get('conversations_dir', '无')}）\n"
-            f"  - {tmp_dir}/artifacts/           → 前序步骤产物\n\n"
+            ("\n".join(prior_outputs) + "\n") if prior_outputs
+            else "（前序步骤暂无产物文件）\n"
+        )
+        step_context += (
+            "\n## 本步骤产物目录（你的报告等产物写这里）\n"
+            f"  绝对路径: {os.path.join(tmp_dir, 'artifacts')}\n"
+            f"  工具相对路径: .dc_tmp/{task_id}/{step_id}/artifacts/<文件名>\n\n"
         )
 
         if step.get("type") == "code_review":

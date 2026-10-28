@@ -1,15 +1,13 @@
-import {type RefObject, useCallback, useEffect, useRef, useState} from 'react'
+import {type RefObject, useCallback, useEffect, useRef} from 'react'
 
-const JUMP_THRESHOLD = 100
-
-const REPIN_FRAMES = 3
+const REPIN_FRAMES = 5
 
 export function useChatAutoScroll(
     containerRef: RefObject<HTMLElement | null>,
     deps: unknown[],
     enabled: boolean,
+    setShowJump: (v: boolean) => void,
 ) {
-  const [showJump, setShowJump] = useState(false)
   const enabledRef = useRef(enabled)
 
   useEffect(() => {
@@ -31,26 +29,13 @@ export function useChatAutoScroll(
       raf = requestAnimationFrame(step)
       return () => cancelAnimationFrame(raf)
     }
-    setShowJump(el.scrollHeight - el.scrollTop - el.clientHeight > JUMP_THRESHOLD)
   }, [...deps, enabled]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    const onScroll = () => {
-      setShowJump(el.scrollHeight - el.scrollTop - el.clientHeight > JUMP_THRESHOLD)
-    }
-    el.addEventListener('scroll', onScroll, {passive: true})
-    onScroll()
-    return () => el.removeEventListener('scroll', onScroll)
-  }, [containerRef])
 
   const jumpToBottom = useCallback(() => {
     const el = containerRef.current
     if (!el) return
     el.scrollTop = el.scrollHeight
-    setShowJump(false)
   }, [containerRef])
 
-  return {jumpToBottom, showJump}
+  return {jumpToBottom}
 }

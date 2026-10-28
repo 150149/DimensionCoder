@@ -11,6 +11,10 @@ import {useTaskPolling} from '../hooks/useTaskPolling'
 
 
 function stepLabel(task: TaskSummary): string {
+  if (task.mode === 'single') {
+    const chat = (task.steps || []).find((s) => s.step_id === 'chat')
+    return chat && chat.status === 'active' ? '对话中' : '等待输入'
+  }
   const steps = task.steps || []
   for (const s of steps) if (s.status === 'active') return s.title
   for (const s of steps) if (s.status === 'pending') return s.title
@@ -19,6 +23,7 @@ function stepLabel(task: TaskSummary): string {
 }
 
 export function isUnstarted(task: TaskSummary): boolean {
+  if (task.mode === 'single') return false
   if (task.status !== 'active') return false
   const steps = task.steps || []
   if (steps.length === 0) return false
@@ -123,13 +128,22 @@ export default function Sidebar({open = false, onClose = noop}: SidebarProps) {
     setWsModalOpen(true)
   }
 
-  const doCreate = async (workspaceDir?: string) => {
+  const doCreate = async (workspaceDir?: string, taskMode?: 'flow' | 'single') => {
     setCreating(true)
     try {
-      const res = workspaceDir
-          ? await api.createTask(desc.trim(), {workspace_dir: workspaceDir})
+      const extra: { workspace_dir?: string; mode?: 'flow' | 'single' } = {}
+      if (workspaceDir) extra.workspace_dir = workspaceDir
+      if (taskMode === 'single') extra.mode = 'single'
+      const res = Object.keys(extra).length
+          ? await api.createTask(desc.trim(), extra)
           : await api.createTask(desc.trim())
       setDesc('')
+      if (taskMode === 'single') {
+        setCreatedTask(null)
+        loadTasks()
+        navigate(`/task/${res.task_id}/chat`)
+        return
+      }
       setCreatedTask({taskId: res.task_id, title: res.title})
       loadTasks()
     } catch (err) {
@@ -189,11 +203,11 @@ export default function Sidebar({open = false, onClose = noop}: SidebarProps) {
                     <div
                         key={t.id}
                         className={`task-card${selectedId === t.id ? ' selected' : ''}${taskStateClass(t) ? ` ${taskStateClass(t)}` : ''}`}
-                        onClick={() => navigate(`/task/${t.id}`)}
+                        onClick={() => navigate(t.mode === 'single' ? `/task/${t.id}/chat` : `/task/${t.id}`)}
                     >
                       <div className="title">
                 <span className="type-icon">
-                  <Icon name={typeIconName(t.type)} size={14}/>
+                  <Icon name={t.mode === 'single' ? 'message' : typeIconName(t.type)} size={14}/>
                 </span>
                         {t.title || 'Untitled'}
                       </div>
@@ -248,9 +262,9 @@ export default function Sidebar({open = false, onClose = noop}: SidebarProps) {
           {restartMsg && <div className="error-toast success">{restartMsg}</div>}
           <CreateTaskModal
               open={wsModalOpen}
-              onConfirm={(workspaceDir) => {
+              onConfirm={(workspaceDir, taskMode) => {
                 setWsModalOpen(false)
-                void doCreate(workspaceDir)
+                void doCreate(workspaceDir, taskMode)
               }}
               onCancel={() => setWsModalOpen(false)}
           />

@@ -29,6 +29,7 @@ export interface TaskSummary {
     pause_level?: string
     assignee?: string
     auto_approve?: boolean
+    mode?: 'flow' | 'single'
     created_at: string
     updated_at: string
     steps: StepDef[]
@@ -47,6 +48,7 @@ export interface CreateTaskResult {
     task_type: string
     title: string
     steps?: StepDef[]
+    mode?: 'flow' | 'single'
 }
 
 export interface TaskDetail {
@@ -151,6 +153,7 @@ export interface StepData {
     truncated?: boolean
     live?: StepLive | null
     decision?: GateApproval | null
+    pendingQuestion?: { question: string; options?: string[] } | null
 }
 
 
@@ -220,6 +223,19 @@ export interface ConfigSave {
     powerCachedPrice?: number
     powerOutputPrice?: number
     mcpServers?: McpServerConfig[]
+}
+
+export interface DailyTokenItem {
+    date: string
+    prompt: number
+    cached: number
+    completion: number
+    total: number
+}
+
+export interface DailyTokenUsage {
+    days: number
+    items: DailyTokenItem[]
 }
 
 export interface FsEntry {
@@ -356,6 +372,14 @@ export interface GateApprovalReadyEvent extends SseEventBase {
     approval: GateApproval
 }
 
+export interface AskUserEvent extends SseEventBase {
+    command: 'askUser'
+    stepId: string
+    callId: string
+    question: string
+    options?: string[]
+}
+
 export interface StepTokensUpdatedEvent extends SseEventBase {
     command: 'stepTokensUpdated'
     stepId: string
@@ -407,6 +431,10 @@ export interface LlmErrorEvent extends SseEventBase {
     model?: string | null
 }
 
+export interface HeartbeatEvent extends SseEventBase {
+    command: 'heartbeat'
+}
+
 export interface PlanChunkEvent extends SseEventBase {
     command: 'planChunk'
     text: string
@@ -441,3 +469,5 @@ export type SseEvent =
     | RoundAbortedEvent
     | StepStatsUpdatedEvent
     | GateApprovalReadyEvent
+    | AskUserEvent
+    | HeartbeatEvent

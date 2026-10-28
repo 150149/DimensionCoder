@@ -77,13 +77,24 @@ class SimSession:
         self._executed: set[int] = set()
         self._dyncode: list = []
         self._trace_on = False
-        self._snap = None
+        self._snaps: dict = {}
         self._raw = b""
         self._pending_ip: Optional[int] = None
         self._disp_counts: dict = {}
         self._unhandled = False
         self._pdata_table = None
         self._dyn_func_tables: list = []
+        self.vm_ctx: dict = {}
+        self.clock_policy = "fixed16"
+        self._auto_mapped_pages: set = set()
+        self._realtime_base: int = int(_time.time() * 1_000_000)
+
+    def advance_clock(self, step: int = 16) -> int:
+        if self.clock_policy == "realtime":
+            self.clock = int(_time.time() * 1_000_000) - self._realtime_base
+        else:
+            self.clock += step
+        return self.clock
 
     def heap_alloc(self, size: int) -> int:
         size = (size + 0xFFF) & ~0xFFF
@@ -114,7 +125,9 @@ class SimSession:
         self._writes = []
         self._executed = set()
         self._dyncode = []
-        self._snap = None
+        self._snaps = {}
+        self.vm_ctx = {}
+        self._auto_mapped_pages = set()
 
         img = load_pe(exe_path)
         self.image = img
@@ -154,7 +167,7 @@ class SimSession:
                     self.uc.reg_write(r, 0)
                 except UcError:
                     pass
-        self._snap = self._snapshot_now()
+        self._snaps["__default__"] = self._snapshot_now()
         self.veh_handlers: list[int] = []
         self.uef_handler = 0
         self._force_eip: Optional[int] = None
@@ -205,7 +218,7 @@ class SimSession:
                     self.uc.reg_write(r, 0)
                 except UcError:
                     pass
-        self._snap = self._snapshot_now()
+        self._snaps["__default__"] = self._snapshot_now()
         self.veh_handlers: list[int] = []
         self.uef_handler = 0
         self._force_eip: Optional[int] = None
@@ -245,6 +258,18 @@ class SimSession:
             lines.append("  [env] PEB64=0x7FFE5000 BeingDebugged=0 NtGlobalFlag=0 GS=0x7FFE4000 (x64)")
         else:
             lines.append("  [env] PEB=0x7FFDE000 BeingDebugged=0 NtGlobalFlag=0 FS=0x7FFD0000")
+        if self.vm_ctx:
+            vc = self.vm_ctx
+            parts = []
+            if "dispatch_rva" in vc:
+                parts.append(f"dispatch=0x{vc['dispatch_rva']:X}({vc.get('dispatch_type','?')})")
+            if "handlers" in vc:
+                parts.append(f"handlers={len(vc['handlers'])}")
+            if "reg_roles" in vc:
+                parts.append(f"reg_roles={len(vc['reg_roles'])}")
+            if parts:
+                lines.append(f"  [vm_ctx] {' | '.join(parts)}")
+        lines.append(f"  [clock] policy={self.clock_policy} | auto_mapped_pages={len(self._auto_mapped_pages)}")
         return "\n".join(lines)
 
     def run(self, until_addr: Optional[int] = None, steps_limit: int = 0,
@@ -644,13 +669,21 @@ class SimSession:
                 imm = uc.mem_read(address + 1, 1)[0]
             except UcError:
                 imm = 0
-            code = 0xC0000409 if imm == 0x29 else (0x80000003 if imm == 0x03 else 0xC0000005)
+            if imm == 0x29:
+                code = 0xC0000409
+            elif imm == 0x03 or imm == 0x2D:
+                code = 0x80000003
+            else:
+                code = 0xC0000005
             if self._dispatch_exception(code, address):
                 return
             if getattr(self, "_unhandled", False):
                 return
             self._pending_ip = address + 2
             uc.emu_stop()
+            if imm == 0x2D:
+                self.api_calls["__int2d__0x%X" % address] = \
+                    self.api_calls.get("__int2d__0x%X" % address, 0) + 1
             return
         if b in (0xED, 0xEC, 0xE4, 0xE5):
             if self._dispatch_exception(0xC0000096, address):
@@ -667,14 +700,26 @@ class SimSession:
     def _on_insn(self, uc, address, size, user_data):
         insn = user_data
         if insn == x86_const.UC_X86_INS_RDTSC:
-            self.clock += 16
-            uc.reg_write(x86_const.UC_X86_REG_EAX, self.clock & 0xFFFFFFFF)
+            clock_val = self.advance_clock(16)
+            uc.reg_write(x86_const.UC_X86_REG_EAX, clock_val & 0xFFFFFFFF)
             uc.reg_write(x86_const.UC_X86_REG_EDX, 0)
         elif insn == x86_const.UC_X86_INS_CPUID:
-            uc.reg_write(x86_const.UC_X86_REG_EAX, 1)
-            uc.reg_write(x86_const.UC_X86_REG_EBX, 0x756E6547)
-            uc.reg_write(x86_const.UC_X86_REG_EDX, 0x49656E69)
-            uc.reg_write(x86_const.UC_X86_REG_ECX, 0x6C65746E)
+            leaf = uc.reg_read(x86_const.UC_X86_REG_EAX) & 0xFFFFFFFF
+            if leaf == 0:
+                uc.reg_write(x86_const.UC_X86_REG_EAX, 0x16)
+                uc.reg_write(x86_const.UC_X86_REG_EBX, 0x756E6547)
+                uc.reg_write(x86_const.UC_X86_REG_EDX, 0x49656E69)
+                uc.reg_write(x86_const.UC_X86_REG_ECX, 0x6C65746E)
+            elif leaf == 1:
+                uc.reg_write(x86_const.UC_X86_REG_EAX, 0x000806E9)
+                uc.reg_write(x86_const.UC_X86_REG_EBX, 0x00100800)
+                uc.reg_write(x86_const.UC_X86_REG_ECX, 0x7FFAFBBF)
+                uc.reg_write(x86_const.UC_X86_REG_EDX, 0xBFEBFBFF)
+            else:
+                uc.reg_write(x86_const.UC_X86_REG_EAX, 0)
+                uc.reg_write(x86_const.UC_X86_REG_EBX, 0)
+                uc.reg_write(x86_const.UC_X86_REG_ECX, 0)
+                uc.reg_write(x86_const.UC_X86_REG_EDX, 0)
         elif insn == x86_const.UC_X86_INS_IN:
             self._dispatch_exception(0xC0000096, address)
 
@@ -1365,12 +1410,14 @@ class SimSession:
         if getattr(self, "_no_dispatch", False):
             return False
         if access in (UC_MEM_READ_UNMAPPED, UC_MEM_WRITE_UNMAPPED):
+            page = address & ~0xFFF
             try:
-                uc.mem_map(address & ~0xFFF, 0x1000)
+                uc.mem_map(page, 0x1000)
             except UcError:
                 pass
-            self.api_calls[f"__mem_map__0x{address & ~0xFFF:X}"] = \
-                self.api_calls.get(f"__mem_map__0x{address & ~0xFFF:X}", 0) + 1
+            self._auto_mapped_pages.add(page)
+            self.api_calls[f"__mem_map__0x{page:X}"] = \
+                self.api_calls.get(f"__mem_map__0x{page:X}", 0) + 1
             return True
         return self._dispatch_exception(0xC0000005, address, write_jmp=True)
 
@@ -1846,16 +1893,22 @@ class SimSession:
             except (UcError, KeyError):
                 pass
 
-    def snapshot(self) -> str:
+    def snapshot(self, name: str = "") -> str:
         if self.uc is None:
             return "[Error] err: 未加载"
-        self._snap = self._snapshot_now()
-        return "snapshot saved（当前状态，改输入后 restore + run 重放）"
+        key = name or "__default__"
+        self._snaps[key] = self._snapshot_now()
+        label = f' "{name}"' if name else ""
+        return f"snapshot{label} saved（当前状态，改输入后 restore + run 重放）"
 
-    def restore(self) -> str:
-        if self._snap is None:
-            return "[Error] err: 无快照"
-        self._restore_now(self._snap)
+    def restore(self, name: str = "") -> str:
+        key = name or "__default__"
+        snap = self._snaps.get(key)
+        if snap is None:
+            avail = [k for k in self._snaps if k != "__default__"]
+            hint = f"（已有命名快照：{avail}）" if avail else "（无快照——先 snapshot）"
+            return f"[Error] err: 无快照{hint}"
+        self._restore_now(snap)
         self.output = []
         self.stop_reason = ""
         self.exit_code = 0
@@ -1863,7 +1916,8 @@ class SimSession:
         self._trace = []
         self._executed = set()
         self._dyncode = []
-        return "restored（输入/输出已重置，可 run）"
+        label = f' "{name}"' if name else ""
+        return f"restored{label}（输入/输出已重置，可 run）"
 
     def reset(self, inputs: Optional[list] = None,
               exe_path: Optional[str] = None) -> str:
@@ -1880,7 +1934,7 @@ class SimSession:
         self.uc = None
         self.stubs = None
         self.image = None
-        self._snap = None
+        self._snaps = {}
         try:
             return self.load(exe, args, new_inputs)
         except Exception as e:  # noqa: BLE001
